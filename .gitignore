@@ -1,0 +1,10 @@
+.venv/
+mongodb/
+mongodb.zip
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+node_modules/
+dist/
