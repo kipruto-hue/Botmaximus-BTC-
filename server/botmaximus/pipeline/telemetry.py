@@ -12,14 +12,23 @@ from botmaximus.config import settings
 
 STAGES = ("gather", "parse", "quality", "store")
 
+# None = event-driven feed with no staleness budget (silence is normal)
 BUDGETS_MS = {
     "btc_price_tick": settings.budget_price_tick_ms,
     "btc_ohlcv_1m": settings.budget_ohlcv_1m_ms,
+    "btc_funding": settings.budget_funding_ms,
+    "btc_open_interest": settings.budget_open_interest_ms,
+    "btc_liquidation": None,
+    "btc_orderbook": settings.budget_orderbook_ms,
 }
 
 FEED_LABELS = {
     "btc_price_tick": "BTC ticks",
     "btc_ohlcv_1m": "BTC OHLCV 1m",
+    "btc_funding": "Funding rate",
+    "btc_open_interest": "Open interest",
+    "btc_liquidation": "Liquidations",
+    "btc_orderbook": "Order book",
 }
 
 
@@ -38,18 +47,32 @@ class Telemetry:
         self._e2e: dict[str, deque[float]] = {}
         self._last_ingest: dict[str, datetime] = {}
         self._last_event: dict[str, datetime] = {}
-        self.counts = {"stored": 0, "quarantined": 0, "gathered": 0}
+        self.counts = {"stored": 0, "quarantined": 0, "gathered": 0, "backfilled": 0}
         self.last_price: float | None = None
         self.last_price_time: datetime | None = None
-        self.ws_connected = False
+        self._ws_sources: dict[str, bool] = {}
         self.ws_reconnects = 0
+
+    @property
+    def ws_connected(self) -> bool:
+        """True only when every registered websocket source is up."""
+        return bool(self._ws_sources) and all(self._ws_sources.values())
+
+    def set_ws(self, source: str, up: bool) -> None:
+        self._ws_sources[source] = up
 
     # ---- recording ----
     def record_stage(self, dataset_id: str, stage: str, ms: float) -> None:
         self._stage.setdefault((dataset_id, stage), deque(maxlen=500)).append(ms)
 
-    def record_stored(self, dataset_id: str, ingest_time: datetime, event_time: datetime) -> None:
+    def record_stored(
+        self, dataset_id: str, ingest_time: datetime, event_time: datetime, backfill: bool = False
+    ) -> None:
         self.counts["stored"] += 1
+        if backfill:
+            # historical fill: counts, but must not touch freshness or e2e stats
+            self.counts["backfilled"] += 1
+            return
         self._last_ingest[dataset_id] = ingest_time
         self._last_event[dataset_id] = event_time
         e2e = (ingest_time - event_time).total_seconds() * 1000
@@ -77,6 +100,7 @@ class Telemetry:
                 st: round(_pct(list(self._stage.get((ds, st), [])), 50), 1) for st in STAGES
             }
             fresh = self.freshness_ms(ds)
+            budget = BUDGETS_MS[ds]
             feeds.append({
                 "dataset_id": ds,
                 "name": label,
@@ -86,8 +110,8 @@ class Telemetry:
                 "s": stage_p50["store"],
                 "p95_ms": round(_pct(list(self._e2e.get(ds, [])), 95), 1),
                 "fresh": None if fresh is None else round(fresh),
-                "budget": BUDGETS_MS[ds],
-                "stale": fresh is not None and fresh > BUDGETS_MS[ds],
+                "budget": budget,
+                "stale": budget is not None and fresh is not None and fresh > budget,
                 "records": len(self._e2e.get(ds, [])),
             })
         all_e2e = [v for d in self._e2e.values() for v in d]
@@ -95,6 +119,7 @@ class Telemetry:
             "running": True,
             "uptime_s": round(time.time() - self.started_at),
             "ws_connected": self.ws_connected,
+            "ws_sources": dict(self._ws_sources),
             "ws_reconnects": self.ws_reconnects,
             "price": self.last_price,
             "price_time": self.last_price_time.isoformat() if self.last_price_time else None,

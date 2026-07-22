@@ -16,18 +16,37 @@ class Settings(BaseSettings):
     # instrument & source
     symbol: str = "BTCUSDT"
     binance_ws_url: str = "wss://stream.binance.com:9443/stream"
+    binance_futures_ws_url: str = "wss://fstream.binance.com"  # routed: /market, /public
+    binance_rest_url: str = "https://api.binance.com"
+    binance_futures_rest_url: str = "https://fapi.binance.com"
 
     # pipeline flow
     queue_maxsize: int = 1000          # bounded queues → backpressure (§2)
     tick_throttle_ms: int = 1000       # store at most one price tick per second
+    funding_throttle_ms: int = 30_000  # mark-price stream is 1/s; funding moves slowly
+    orderbook_throttle_ms: int = 5_000 # depth snapshots stored at most once per 5s
+    oi_poll_s: int = 30                # open interest REST poll cadence
+
+    # OHLCV gap backfill (§11 step 4): heal candles missed during dead sockets
+    backfill_enabled: bool = True
+    backfill_scan_minutes: int = 180   # look for holes this far back
+    backfill_check_s: int = 60
 
     # staleness budgets, ms (§9) — a dataset over budget is excluded from live use
     budget_price_tick_ms: int = 3_000
     budget_ohlcv_1m_ms: int = 75_000
+    budget_funding_ms: int = 90_000
+    budget_open_interest_ms: int = 120_000
+    budget_orderbook_ms: int = 30_000
+    # liquidations are event-driven and legitimately silent for hours → no budget
 
     # retention / TTL, seconds (§10)
     ttl_price_ticks_s: int = 7 * 24 * 3600        # 7 days of 1/s ticks
     ttl_ohlcv_1m_s: int = 10 * 365 * 24 * 3600    # keep candles ~10 years
+    ttl_funding_s: int = 2 * 365 * 24 * 3600
+    ttl_open_interest_s: int = 2 * 365 * 24 * 3600
+    ttl_liquidations_s: int = 365 * 24 * 3600
+    ttl_orderbook_s: int = 30 * 24 * 3600         # heavy — keep 30 days of snapshots
 
     # quality gate (§8)
     max_minute_move_pct: float = 5.0   # phantom-tick jump threshold vs previous record

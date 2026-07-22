@@ -202,7 +202,7 @@ export default function Dashboard() {
   const liveUptime = snap?.uptime_s ?? uptime;
   const wsUp = connected && snap?.ws_connected;
   const feedRows = snap?.feeds?.length ? snap.feeds : null;
-  const freshLabel = (f) => f == null ? "—" : f > 9999 ? `${(f / 1000).toFixed(0)}s` : `${Math.round(f)}ms`;
+  const freshLabel = (f) => f == null ? "—" : f > 120000 ? `${(f / 60000).toFixed(0)}m` : f > 9999 ? `${(f / 1000).toFixed(0)}s` : `${Math.round(f)}ms`;
 
   const uh = Math.floor(liveUptime / 3600), um = Math.floor((liveUptime % 3600) / 60), us = liveUptime % 60;
   const eta = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -312,8 +312,8 @@ export default function Dashboard() {
               <>
                 <div style={{ display: "grid", gridTemplateColumns: "112px 1fr 82px", gap: "0 12px", alignItems: "center" }}>
                   {feedRows.map((f) => {
-                    const stale = f.stale ?? (f.fresh != null && f.fresh > f.budget);
-                    const warn = f.fresh != null && f.fresh > f.budget * 0.6;
+                    const stale = f.stale ?? (f.budget != null && f.fresh != null && f.fresh > f.budget);
+                    const warn = f.budget != null && f.fresh != null && f.fresh > f.budget * 0.6;
                     const fc = f.fresh == null ? C.dim : stale ? C.red : warn ? C.amber : C.green;
                     const tot = Math.max(1, f.g + f.p + f.q + f.s);
                     return (

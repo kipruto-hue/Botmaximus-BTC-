@@ -28,6 +28,7 @@ class Envelope:
     reaction_ref: Any = None
     stage_latency_ms: dict[str, float] = field(default_factory=dict)
     quarantine_reasons: list[str] = field(default_factory=list)
+    backfill: bool = False  # fetched via REST to heal a gap, not received live
 
     def __post_init__(self) -> None:
         for name in ("event_time", "collection_time", "ingest_time"):
@@ -47,6 +48,7 @@ class Envelope:
             "quality_ok": self.quality_ok,
             "reaction_ref": self.reaction_ref,
             "stage_latency_ms": self.stage_latency_ms,
+            "backfill": self.backfill,
         }
 
     @property

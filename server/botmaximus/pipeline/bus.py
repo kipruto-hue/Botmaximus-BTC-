@@ -28,6 +28,7 @@ class RawItem:
     symbol: str
     raw: dict[str, Any]
     collection_time: datetime
+    backfill: bool = False
 
 
 class Pipeline:
@@ -94,5 +95,4 @@ class Pipeline:
                 log.exception("store failed for %s", env.dataset_id)
                 continue
             store_ms = (time.perf_counter() - t0) * 1000
-            env.stage_latency_ms["store"] = round(store_ms, 2)
             telemetry.record_stage(env.dataset_id, "store", store_ms)

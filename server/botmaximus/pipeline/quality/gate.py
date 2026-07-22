@@ -28,14 +28,24 @@ class QualityGate:
         self._layer_freshness(env)
         self._layer_source(env)
 
-        if not env.quarantine_reasons:
-            self._prev_price[env.dataset_id] = self._price_of(env)
+        if not env.quarantine_reasons and not env.backfill:
+            price = self._price_of(env)
+            if price is not None:
+                self._prev_price[env.dataset_id] = price
             self._prev_event_time[env.dataset_id] = env.event_time
         return env
 
     @staticmethod
-    def _price_of(env: Envelope) -> float:
-        return env.payload.get("price") or env.payload.get("close") or 0.0
+    def _price_of(env: Envelope) -> float | None:
+        """Reference price for continuity checks; None = dataset has no single price."""
+        p = env.payload
+        if env.dataset_id == "btc_price_tick":
+            return p.get("price")
+        if env.dataset_id == "btc_ohlcv_1m":
+            return p.get("close")
+        if env.dataset_id == "btc_funding":
+            return p.get("mark_price")
+        return None
 
     def _layer_timestamps(self, env: Envelope) -> None:
         """Layer 4 (§8): lookahead protection is absolute — quarantine."""
@@ -45,21 +55,53 @@ class QualityGate:
             env.quality_ok = False
 
     def _layer_sanity(self, env: Envelope) -> None:
-        """Layer 2: phantom ticks and impossible quotes."""
+        """Layer 2: impossible values per dataset; phantom jumps on price series."""
         p = env.payload
+        ds = env.dataset_id
+
         price = self._price_of(env)
-        if price <= 0:
+        if price is not None and price <= 0:
             env.quarantine_reasons.append("nonpositive_price")
             env.quality_ok = False
             return
-        if env.dataset_id == "btc_ohlcv_1m":
+
+        if ds == "btc_ohlcv_1m":
             o, h, l, c = p["open"], p["high"], p["low"], p["close"]
             if not (h >= max(o, c) >= min(o, c) >= l > 0):
                 env.quarantine_reasons.append("ohlc_incoherent")
                 env.quality_ok = False
                 return
-        prev = self._prev_price.get(env.dataset_id)
-        if prev and prev > 0:
+        elif ds == "btc_funding":
+            if p["index_price"] <= 0:
+                env.quarantine_reasons.append("nonpositive_price")
+                env.quality_ok = False
+                return
+            if abs(p["funding_rate"]) > 0.02:  # |2%| per 8h is impossible on Binance
+                env.quarantine_reasons.append("funding_rate_implausible")
+                env.quality_ok = False
+                return
+        elif ds == "btc_open_interest":
+            if p["open_interest"] <= 0:
+                env.quarantine_reasons.append("nonpositive_open_interest")
+                env.quality_ok = False
+                return
+        elif ds == "btc_liquidation":
+            if p["price"] <= 0 or p["qty"] <= 0 or p["side"] not in ("BUY", "SELL"):
+                env.quarantine_reasons.append("liquidation_incoherent")
+                env.quality_ok = False
+                return
+        elif ds == "btc_orderbook":
+            if p["best_bid"] <= 0 or p["best_ask"] <= 0:
+                env.quarantine_reasons.append("nonpositive_price")
+                env.quality_ok = False
+                return
+            if p["best_bid"] >= p["best_ask"]:
+                env.quarantine_reasons.append("crossed_book")
+                env.quality_ok = False
+                return
+
+        prev = self._prev_price.get(ds)
+        if not env.backfill and price is not None and prev and prev > 0:
             move_pct = abs(price - prev) / prev * 100
             if move_pct > settings.max_minute_move_pct:
                 env.quality_flags.append("phantom_suspect")
@@ -78,7 +120,11 @@ class QualityGate:
             env.quality_flags.append("illiquid_window")
 
     def _layer_freshness(self, env: Envelope) -> None:
-        """Layer 1: over the staleness budget → not usable for live decisions."""
+        """Layer 1: over the staleness budget → not usable for live decisions.
+        Backfilled records are historical by definition — flagged, not failed."""
+        if env.backfill:
+            env.quality_flags.append("backfill")
+            return
         budget = BUDGETS_MS.get(env.dataset_id)
         if budget is None:
             return

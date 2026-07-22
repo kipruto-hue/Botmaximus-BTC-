@@ -32,16 +32,16 @@ class BaseWSCollector(abc.ABC):
             try:
                 async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
                     log.info("[%s] connected to %s", self.name, self.url)
-                    telemetry.ws_connected = True
+                    telemetry.set_ws(self.name, True)
                     backoff = 1.0
                     async for message in ws:
                         telemetry.counts["gathered"] += 1
                         await self.handle(message)
             except asyncio.CancelledError:
-                telemetry.ws_connected = False
+                telemetry.set_ws(self.name, False)
                 raise
             except Exception as e:
-                telemetry.ws_connected = False
+                telemetry.set_ws(self.name, False)
                 telemetry.ws_reconnects += 1
                 delay = backoff + random.uniform(0, backoff / 2)
                 log.warning("[%s] connection lost (%s) — reconnecting in %.1fs", self.name, e, delay)

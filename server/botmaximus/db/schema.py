@@ -15,11 +15,19 @@ log = logging.getLogger(__name__)
 DATASET_COLLECTIONS = {
     "btc_price_tick": "btc_price_ticks",
     "btc_ohlcv_1m": "btc_ohlcv_1m",
+    "btc_funding": "btc_funding",
+    "btc_open_interest": "btc_open_interest",
+    "btc_liquidation": "btc_liquidations",
+    "btc_orderbook": "btc_orderbook",
 }
 
 TIMESERIES = {
     "btc_price_ticks": {"granularity": "seconds", "ttl_s": settings.ttl_price_ticks_s},
     "btc_ohlcv_1m": {"granularity": "minutes", "ttl_s": settings.ttl_ohlcv_1m_s},
+    "btc_funding": {"granularity": "seconds", "ttl_s": settings.ttl_funding_s},
+    "btc_open_interest": {"granularity": "seconds", "ttl_s": settings.ttl_open_interest_s},
+    "btc_liquidations": {"granularity": "seconds", "ttl_s": settings.ttl_liquidations_s},
+    "btc_orderbook": {"granularity": "seconds", "ttl_s": settings.ttl_orderbook_s},
 }
 
 QUARANTINE = "quarantine"

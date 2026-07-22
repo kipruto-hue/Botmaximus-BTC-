@@ -34,7 +34,7 @@ def test_to_doc_shape():
     assert doc["reaction_ref"] is None
     assert set(doc) == {
         "event_time", "meta", "collection_time", "ingest_time", "payload",
-        "quality_flags", "quality_ok", "reaction_ref", "stage_latency_ms",
+        "quality_flags", "quality_ok", "reaction_ref", "stage_latency_ms", "backfill",
     }
 
 

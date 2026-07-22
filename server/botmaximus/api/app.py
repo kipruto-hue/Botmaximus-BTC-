@@ -15,8 +15,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from botmaximus.config import settings
 from botmaximus.db import mongo
 from botmaximus.db.schema import DATASET_COLLECTIONS, QUARANTINE, ensure_schema
+from botmaximus.pipeline.backfill import OhlcvBackfiller
 from botmaximus.pipeline.bus import Pipeline
 from botmaximus.pipeline.collectors.binance import BinanceCollector
+from botmaximus.pipeline.collectors.binance_futures import (
+    BinanceFuturesDepthCollector,
+    BinanceFuturesMarketCollector,
+)
+from botmaximus.pipeline.collectors.binance_oi import BinanceOICollector
 from botmaximus.pipeline.parsers.binance import BinanceParser
 from botmaximus.pipeline.quality.gate import QualityGate
 from botmaximus.pipeline.telemetry import telemetry
@@ -32,14 +38,23 @@ async def lifespan(app: FastAPI):
     await writer.seed_dedupe()
     pipeline = Pipeline(parser=BinanceParser(), gate=QualityGate(), writer=writer)
     pipeline.start()
-    collector = BinanceCollector(pipeline.gather_q)
-    collector_task = asyncio.create_task(collector.run(), name="binance_collector")
-    log.info("pipeline started")
+    sources = [
+        BinanceCollector(pipeline.gather_q),
+        BinanceFuturesMarketCollector(pipeline.gather_q),
+        BinanceFuturesDepthCollector(pipeline.gather_q),
+        BinanceOICollector(pipeline.gather_q),
+        OhlcvBackfiller(pipeline.gather_q),
+    ]
+    source_tasks = [
+        asyncio.create_task(s.run(), name=f"{s.name}_collector") for s in sources
+    ]
+    log.info("pipeline started (%d sources)", len(sources))
     try:
         yield
     finally:
-        collector_task.cancel()
-        await asyncio.gather(collector_task, return_exceptions=True)
+        for t in source_tasks:
+            t.cancel()
+        await asyncio.gather(*source_tasks, return_exceptions=True)
         await pipeline.stop()
         await mongo.close()
 
@@ -91,6 +106,17 @@ async def get_ohlcv(limit: int = 10):
 async def get_ticks(limit: int = 10):
     db = mongo.get_db()
     cursor = db[DATASET_COLLECTIONS["btc_price_tick"]].find().sort("event_time", -1).limit(min(limit, 500))
+    return [_serialize(d) async for d in cursor]
+
+
+@app.get("/api/data/{dataset_id}")
+async def get_dataset(dataset_id: str, limit: int = 10):
+    """Latest records for any dataset (funding, OI, liquidations, order book, …)."""
+    coll = DATASET_COLLECTIONS.get(dataset_id)
+    if coll is None:
+        return {"error": f"unknown dataset_id; one of {sorted(DATASET_COLLECTIONS)}"}
+    db = mongo.get_db()
+    cursor = db[coll].find().sort("event_time", -1).limit(min(limit, 500))
     return [_serialize(d) async for d in cursor]
 
 
