@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from botmaximus.config import settings
 from botmaximus.db import mongo
 from botmaximus.db.schema import DATASET_COLLECTIONS, QUARANTINE, ensure_schema
+from botmaximus.pipeline import coverage
 from botmaximus.pipeline.backfill import OhlcvBackfiller
 from botmaximus.pipeline.bus import Pipeline
 from botmaximus.pipeline.collectors.binance import BinanceCollector
@@ -22,18 +23,33 @@ from botmaximus.pipeline.collectors.binance_futures import (
     BinanceFuturesDepthCollector,
     BinanceFuturesMarketCollector,
 )
+from botmaximus.pipeline.collectors.binance_history import (
+    FundingHistoryCollector,
+    OIHistoryCollector,
+)
 from botmaximus.pipeline.collectors.binance_oi import BinanceOICollector
+from botmaximus.pipeline.coverage import CoverageHeartbeat
 from botmaximus.pipeline.parsers.binance import BinanceParser
 from botmaximus.pipeline.quality.gate import QualityGate
 from botmaximus.pipeline.telemetry import telemetry
 from botmaximus.pipeline.writer import Writer
+from botmaximus.risk.core import RiskCore
 
 log = logging.getLogger(__name__)
+
+risk_core: RiskCore | None = None
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
+    global risk_core
     await ensure_schema()
+    await coverage.ensure_indexes()
+
+    # risk core loads persisted equity/peak/kill state — a restart never resets it
+    risk_core = RiskCore(mongo.get_db())
+    await risk_core.load()
+
     writer = Writer()
     await writer.seed_dedupe()
     pipeline = Pipeline(parser=BinanceParser(), gate=QualityGate(), writer=writer)
@@ -44,6 +60,9 @@ async def lifespan(app: FastAPI):
         BinanceFuturesDepthCollector(pipeline.gather_q),
         BinanceOICollector(pipeline.gather_q),
         OhlcvBackfiller(pipeline.gather_q),
+        FundingHistoryCollector(pipeline.gather_q),
+        OIHistoryCollector(pipeline.gather_q),
+        CoverageHeartbeat(),
     ]
     source_tasks = [
         asyncio.create_task(s.run(), name=f"{s.name}_collector") for s in sources
@@ -93,6 +112,23 @@ async def health():
 @app.get("/api/telemetry")
 async def get_telemetry():
     return telemetry.snapshot()
+
+
+@app.get("/api/risk")
+async def get_risk():
+    """Risk core state: limits, kill stack, equity peak/drawdown (§4)."""
+    if risk_core is None:
+        return {"error": "risk core not initialised"}
+    return risk_core.snapshot()
+
+
+@app.get("/api/coverage")
+async def get_coverage(feed: str = "btc_ohlcv_1m", hours: int = 24):
+    """Coverage-ledger summary for a feed over the last `hours` (§5.1)."""
+    from datetime import datetime, timedelta, timezone
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+    return await coverage.summary(feed, start, end)
 
 
 @app.get("/api/ohlcv")

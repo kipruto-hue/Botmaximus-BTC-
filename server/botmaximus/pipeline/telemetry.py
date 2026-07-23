@@ -20,6 +20,8 @@ BUDGETS_MS = {
     "btc_open_interest": settings.budget_open_interest_ms,
     "btc_liquidation": None,
     "btc_orderbook": settings.budget_orderbook_ms,
+    "btc_funding_8h": None,        # settled history series, not a live feed
+    "btc_oi_5m": None,
 }
 
 FEED_LABELS = {
@@ -29,6 +31,8 @@ FEED_LABELS = {
     "btc_open_interest": "Open interest",
     "btc_liquidation": "Liquidations",
     "btc_orderbook": "Order book",
+    "btc_funding_8h": "Funding 8h hist",
+    "btc_oi_5m": "OI 5m hist",
 }
 
 
@@ -60,6 +64,9 @@ class Telemetry:
 
     def set_ws(self, source: str, up: bool) -> None:
         self._ws_sources[source] = up
+
+    def ws_source_up(self, source: str) -> bool:
+        return self._ws_sources.get(source, False)
 
     # ---- recording ----
     def record_stage(self, dataset_id: str, stage: str, ms: float) -> None:

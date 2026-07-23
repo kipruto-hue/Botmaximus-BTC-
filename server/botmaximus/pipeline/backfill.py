@@ -61,6 +61,19 @@ class OhlcvBackfiller:
         self.gather_q = gather_q
         self.url = f"{settings.binance_rest_url}/api/v3/klines"
 
+    async def _boot_scan_minutes(self) -> int:
+        """Scan from the last stored candle → now, so a shutdown of any length
+        heals completely (§5.1: never a fixed window that silently truncates).
+        Empty DB → fall back to the configured deep-seed window."""
+        db = get_db()
+        doc = await db[DATASET_COLLECTIONS["btc_ohlcv_1m"]].find_one(
+            {}, sort=[("event_time", -1)], projection={"event_time": 1}
+        )
+        if not doc:
+            return settings.backfill_startup_scan_minutes
+        gap_minutes = (datetime.now(timezone.utc) - doc["event_time"]).total_seconds() / 60
+        return max(settings.backfill_scan_minutes, int(gap_minutes) + 2)
+
     async def _find_gaps(self, scan_minutes: int) -> list[datetime]:
         db = get_db()
         now = datetime.now(timezone.utc)
@@ -105,7 +118,7 @@ class OhlcvBackfiller:
     async def run(self) -> None:
         if not settings.backfill_enabled:
             return
-        scan_minutes = settings.backfill_startup_scan_minutes  # deep scan on boot
+        scan_minutes = await self._boot_scan_minutes()  # last-stored → now on boot
         async with httpx.AsyncClient(timeout=15) as client:
             while True:
                 try:

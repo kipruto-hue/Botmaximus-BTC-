@@ -85,6 +85,16 @@ class QualityGate:
                 env.quarantine_reasons.append("nonpositive_open_interest")
                 env.quality_ok = False
                 return
+        elif ds == "btc_oi_5m":
+            if p["open_interest"] <= 0:
+                env.quarantine_reasons.append("nonpositive_open_interest")
+                env.quality_ok = False
+                return
+        elif ds == "btc_funding_8h":
+            if abs(p["funding_rate"]) > 0.02:  # |2%| per 8h is impossible on Binance
+                env.quarantine_reasons.append("funding_rate_implausible")
+                env.quality_ok = False
+                return
         elif ds == "btc_liquidation":
             if p["price"] <= 0 or p["qty"] <= 0 or p["side"] not in ("BUY", "SELL"):
                 env.quarantine_reasons.append("liquidation_incoherent")

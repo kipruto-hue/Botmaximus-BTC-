@@ -58,6 +58,22 @@ class Settings(BaseSettings):
     embargo_window_s: int = 60
     reaction_lags: str = "1m,5m,15m,1h,4h,1d"
 
+    # ---- decision layer (Decision & Execution Master Prompt §3) ----
+    # Locked by operator 2026-07-23; layers that need a None value must fail loudly.
+    holding_period_target_s: int = 300          # ~5min holds, high frequency
+    order_style: str = "taker"
+    max_drawdown_kill_pct: float = 15.0         # L3 master kill, from equity peak
+    risk_per_trade_pct: float = 0.25
+    max_open_risk_pct: float = 1.0
+    daily_loss_limit_pct: float = 3.0           # L2 portfolio halt
+    leverage_cap: float = 3.0
+    margin_mode: str = "isolated"
+    position_mode: str = "one_way"
+    starting_equity_paper: float = 10_000.0
+    liq_stop_buffer_pct: float = 20.0           # stop sits ≥ this % of stop-distance inside liq price
+    llm_model: str | None = None                # set at Scrutiny Gate pass; consumers raise if unset
+    paper_fill_model: str | None = None         # set at execution pass
+
     # api
     api_host: str = "127.0.0.1"
     api_port: int = 8300

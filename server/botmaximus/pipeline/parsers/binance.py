@@ -16,6 +16,8 @@ class BinanceParser:
             "btc_liquidation": self._parse_force_order,
             "btc_orderbook": self._parse_depth,
             "btc_open_interest": self._parse_open_interest,
+            "btc_funding_8h": self._parse_funding_hist,
+            "btc_oi_5m": self._parse_oi_hist,
         }.get(item.dataset_id)
         if fn is None:
             raise ValueError(f"unknown dataset_id {item.dataset_id}")
@@ -123,4 +125,28 @@ class BinanceParser:
             event_time=from_epoch_ms(d["time"]),
             collection_time=item.collection_time,
             payload={"open_interest": float(d["openInterest"])},
+        )
+
+    def _parse_funding_hist(self, item: RawItem) -> Envelope:
+        """REST fundingRate row: {symbol, fundingRate, fundingTime}. The settled
+        8h series the cost model charges from."""
+        d = item.raw
+        return Envelope(
+            dataset_id=item.dataset_id, source=item.source, symbol=item.symbol,
+            event_time=from_epoch_ms(d["fundingTime"]),
+            collection_time=item.collection_time,
+            payload={"funding_rate": float(d["fundingRate"])},
+        )
+
+    def _parse_oi_hist(self, item: RawItem) -> Envelope:
+        """REST openInterestHist row: {sumOpenInterest, sumOpenInterestValue, timestamp}."""
+        d = item.raw
+        return Envelope(
+            dataset_id=item.dataset_id, source=item.source, symbol=item.symbol,
+            event_time=from_epoch_ms(d["timestamp"]),
+            collection_time=item.collection_time,
+            payload={
+                "open_interest": float(d["sumOpenInterest"]),
+                "open_interest_value_usd": float(d["sumOpenInterestValue"]),
+            },
         )
