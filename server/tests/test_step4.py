@@ -131,6 +131,49 @@ def test_missing_minutes_none_when_complete():
     assert missing_minutes(existing, base, base + timedelta(minutes=4)) == []
 
 
+def test_fetch_paginates_past_1000_kline_limit():
+    """A gap span longer than 1000 minutes needs multiple REST requests."""
+    import asyncio
+
+    from botmaximus.pipeline.backfill import MINUTE_MS, OhlcvBackfiller
+
+    base_close = 1_753_000_000_000 - (1_753_000_000_000 % MINUTE_MS) + MINUTE_MS - 1
+    gaps = [datetime.fromtimestamp((base_close + i * MINUTE_MS) / 1000, tz=UTC)
+            for i in range(1500)]
+
+    class FakeResp:
+        def __init__(self, rows):
+            self._rows = rows
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return self._rows
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+        async def get(self, url, params):
+            self.calls.append(params)
+            start, end = params["startTime"], params["endTime"]
+            rows = []
+            t = start - (start % MINUTE_MS)
+            while len(rows) < 1000 and t + MINUTE_MS - 1 <= end:
+                close = t + MINUTE_MS - 1
+                if close >= start:
+                    rows.append([t, "1", "1", "1", "1", "1", close, "1", 1])
+                t += MINUTE_MS
+            return FakeResp(rows)
+
+    q = asyncio.Queue()
+    bf = OhlcvBackfiller(q)
+    client = FakeClient()
+    asyncio.run(bf._fetch_and_enqueue(client, gaps))
+    assert len(client.calls) == 2          # 1000 + 500
+    assert q.qsize() == 1500
+    item = q.get_nowait()
+    assert item.backfill
+
+
 def test_kline_row_round_trips_through_parser():
     row = [1753181040000, "66000", "66010", "65990", "66005", "10.5",
            1753181099999, "693000.0", 812]

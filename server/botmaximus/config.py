@@ -29,7 +29,8 @@ class Settings(BaseSettings):
 
     # OHLCV gap backfill (§11 step 4): heal candles missed during dead sockets
     backfill_enabled: bool = True
-    backfill_scan_minutes: int = 180   # look for holes this far back
+    backfill_scan_minutes: int = 180            # periodic cycles look this far back
+    backfill_startup_scan_minutes: int = 10_080 # first cycle after boot: 7 days
     backfill_check_s: int = 60
 
     # staleness budgets, ms (§9) — a dataset over budget is excluded from live use
