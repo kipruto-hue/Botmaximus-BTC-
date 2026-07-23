@@ -74,6 +74,20 @@ class Settings(BaseSettings):
     llm_model: str | None = None                # set at Scrutiny Gate pass; consumers raise if unset
     paper_fill_model: str | None = None         # set at execution pass
 
+    # ---- backtest cost model (§5.3) — never frictionless ----
+    taker_fee_rate: float = 0.0005              # Binance USDⓈ-M taker, each side
+    slippage_bps: float = 1.0                   # conservative constant floor, never zero
+    latency_bars: int = 1                       # decision→fill delay, in 1m bars
+
+    # ---- backtest validation gate (§5.5) ----
+    bt_walkforward_folds: int = 4
+    bt_purge_bars: int = 5                      # ≈ holding period; drop label-overlapping samples
+    bt_embargo_bars: int = 5
+    bt_min_trades: int = 30                     # statistical power floor
+    bt_max_drawdown_pct: float = 25.0
+    bt_min_regimes_positive: int = 2
+    bt_candidate_trials: int = 1                # N trials for deflated-Sharpe correction
+
     # api
     api_host: str = "127.0.0.1"
     api_port: int = 8300
