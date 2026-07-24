@@ -95,17 +95,13 @@ function RiskGauge({ dd, kill }) {
 
 /* ============================ main ============================ */
 export default function Dashboard() {
-  const { connected, snap } = useLive();
+  const { connected, snap, risk } = useLive();
 
   const [running, setRunning] = useState(true);
   const [confirmKill, setConfirmKill] = useState(false);
   const [hb, setHb] = useState(true);
   const [uptime, setUptime] = useState(0);
   const [btc, setBtc] = useState(64210);
-  const [equity, setEquity] = useState(10000);
-  const [dayPnl, setDayPnl] = useState(-142);
-  const [dd, setDd] = useState(6.4);
-  const kill = 18;
 
   const [positions, setPositions] = useState([
     { id: "P-1", side: "LONG", size: 0.018, entry: 63980, stop: 63620, pnl: 41 },
@@ -159,8 +155,6 @@ export default function Dashboard() {
       let move = rnd(-55, 55);
       setBtc((b) => Math.max(1000, b + move));
       setPositions((ps) => ps.map((p) => ({ ...p, pnl: Math.round(p.pnl + (p.side === "LONG" ? move : -move) * p.size * 1.4) })));
-      setDayPnl((d) => Math.round(d + rnd(-14, 16)));
-      setDd((v) => Math.max(0, Math.min(kill + 1, v + rnd(-0.25, 0.22))));
 
       setStrats((ss) => ss.map((s) => ({ ...s, decay: Math.max(0, Math.min(1, s.decay + rnd(-0.02, 0.025))) })));
 
@@ -195,7 +189,7 @@ export default function Dashboard() {
     setPositions([]);
     setScrutiny((sc) => [{ id: idRef.current++, t: new Date().toTimeString().slice(0, 8), v: "KILL", tf: "—", conv: 1, thesis: "MASTER KILL engaged · all positions flattened · system halted", contra: [] }, ...sc].slice(0, 9));
   };
-  const restart = () => { setRunning(true); setDayPnl(0); };
+  const restart = () => { setRunning(true); };
 
   /* ---- live values from the data layer (fall back to sim when disconnected) ---- */
   const liveBtc = snap?.price ?? btc;
@@ -203,6 +197,19 @@ export default function Dashboard() {
   const wsUp = connected && snap?.ws_connected;
   const feedRows = snap?.feeds?.length ? snap.feeds : null;
   const freshLabel = (f) => f == null ? "—" : f > 120000 ? `${(f / 60000).toFixed(0)}m` : f > 9999 ? `${(f / 1000).toFixed(0)}s` : `${Math.round(f)}ms`;
+
+  /* ---- REAL risk core (/api/risk). null when engine is unreachable → SIM. ---- */
+  const riskLive = !!risk;
+  const dd = risk?.drawdown_pct ?? 0;
+  const kill = risk?.limits?.max_drawdown_kill_pct ?? 15;
+  const equity = risk?.equity ?? 10000;
+  const dayPnlPct = risk?.day_pnl_pct ?? 0;
+  const openRiskUsd = risk?.open_risk_usd ?? 0;
+  const openRiskPct = equity ? (openRiskUsd / equity) * 100 : 0;
+  const riskPerTrade = risk?.limits?.risk_per_trade_pct ?? 0.25;
+  const kstack = risk?.kills;
+  const killState = kstack?.l3_killed ? "L3 KILLED" : kstack?.l2_halted ? "L2 HALTED"
+    : (kstack && Object.keys(kstack.l1_suspended || {}).length) ? "L1 active" : "all clear";
 
   const uh = Math.floor(liveUptime / 3600), um = Math.floor((liveUptime % 3600) / 60), us = liveUptime % 60;
   const eta = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -285,14 +292,17 @@ export default function Dashboard() {
       <div style={{ display: "grid", gridTemplateColumns: "232px 1fr 320px", gap: 12, alignItems: "stretch" }}>
         {/* left column */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <Panel title="Risk to kill" icon={<GaugeIcon size={14} color={C.mut} />} sim style={{ height: 300 }}>
+          <Panel title="Risk to kill" icon={<GaugeIcon size={14} color={C.mut} />} sim={!riskLive} style={{ height: 300 }}>
             <RiskGauge dd={dd} kill={kill} />
           </Panel>
-          <Panel title="Account" icon={<Cpu size={14} color={C.mut} />} sim style={{ flex: 1 }}>
-            <Stat label="Equity" val={`$${fmt(equity)}`} c={C.txt} />
-            <Stat label="Day PnL" val={`${dayPnl >= 0 ? "+" : ""}${fmt(dayPnl)}`} c={dayPnl >= 0 ? C.green : C.red} />
-            <Stat label="Open risk" val="1.4% eq" c={C.mut} />
-            <Stat label="Risk / trade" val="0.35%" c={C.mut} />
+          <Panel title="Account" icon={<Cpu size={14} color={C.mut} />} sim={!riskLive}
+            right={<span style={{ fontFamily: F.mono, fontSize: 9, color: C.dim }}>paper</span>}
+            style={{ flex: 1 }}>
+            <Stat label="Equity" val={`$${fmt(equity, 2)}`} c={C.txt} />
+            <Stat label="Day PnL" val={`${dayPnlPct >= 0 ? "+" : ""}${dayPnlPct.toFixed(2)}%`} c={dayPnlPct >= 0 ? C.green : C.red} />
+            <Stat label="Open risk" val={`${openRiskPct.toFixed(2)}% eq`} c={C.mut} />
+            <Stat label="Risk / trade" val={`${riskPerTrade}%`} c={C.mut} />
+            <Stat label="Kill stack" val={killState} c={killState === "all clear" ? C.green : C.red} />
             <div style={{ marginTop: 10, fontFamily: F.mono, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
               L1 strat · L2 daily-loss · L3 max-DD<br />all armed · LLM cannot override
             </div>

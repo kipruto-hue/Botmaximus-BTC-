@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 
 /**
- * Live link to the BOTMAXIMUS data layer.
- * Primary: websocket /ws/live (snapshot every ~1.5s).
+ * Live link to the BOTMAXIMUS data layer + risk core.
+ * Primary: websocket /ws/live (telemetry snapshot every ~1.5s).
  * Fallback: poll /api/telemetry every 2.5s when the socket is down.
- * Returns { connected, snap } — snap is the server telemetry snapshot or null.
+ * Risk: poll /api/risk every 3s (real equity, drawdown, limits, kill stack).
+ * Returns { connected, snap, risk } — snap/risk are the server payloads or null.
  */
 export default function useLive() {
   const [connected, setConnected] = useState(false);
   const [snap, setSnap] = useState(null);
+  const [risk, setRisk] = useState(null);
   const wsRef = useRef(null);
 
   useEffect(() => {
@@ -22,6 +24,18 @@ export default function useLive() {
         if (r.ok && alive) setSnap(await r.json());
       } catch { /* server down — snap stays stale */ }
     };
+
+    const pollRisk = async () => {
+      try {
+        const r = await fetch("/api/risk");
+        if (r.ok && alive) {
+          const j = await r.json();
+          setRisk(j.error ? null : j);
+        }
+      } catch { /* engine down — risk stays null → panels fall back to SIM */ }
+    };
+    pollRisk();
+    const riskTimer = setInterval(pollRisk, 3000);
 
     const connect = () => {
       if (!alive) return;
@@ -49,9 +63,10 @@ export default function useLive() {
       alive = false;
       clearTimeout(retryTimer);
       if (pollTimer) clearInterval(pollTimer);
+      clearInterval(riskTimer);
       wsRef.current?.close();
     };
   }, []);
 
-  return { connected, snap };
+  return { connected, snap, risk };
 }
