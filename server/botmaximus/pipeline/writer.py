@@ -66,3 +66,71 @@ class Writer:
         if last is None or env.event_time > last:
             self._last_written[env.dataset_id] = env.event_time
         telemetry.record_stored(env.dataset_id, env.ingest_time, env.event_time, backfill=env.backfill)
+
+    async def write_many(self, envs: list[Envelope]) -> int:
+        """Batch store for deep historical backfill — same storage authority as
+        `write`, but one existence query and one insert per batch instead of per
+        record. The per-record path's find_one dedupe is fine for healing a
+        handful of gaps; at 10^6 candles it would be 2M round-trips.
+
+        Backfill-only by contract: live records must keep the monotonic dedupe
+        and per-record timing in `write`.
+        """
+        if not envs:
+            return 0
+        if not all(e.backfill for e in envs):
+            raise ValueError("write_many is backfill-only (§5.1)")
+        datasets = {e.dataset_id for e in envs}
+        if len(datasets) != 1:
+            raise ValueError(f"write_many takes one dataset at a time, got {datasets}")
+
+        db = get_db()
+        dataset_id = envs[0].dataset_id
+
+        quarantined = [e for e in envs if e.quarantine_reasons]
+        if quarantined:
+            docs = []
+            for e in quarantined:
+                d = e.to_doc()
+                d["quarantine_reasons"] = e.quarantine_reasons
+                docs.append(d)
+            await db[QUARANTINE].insert_many(docs)
+            for _ in docs:
+                telemetry.record_quarantined()
+            log.warning("quarantined %d %s records", len(docs), dataset_id)
+
+        clean = [e for e in envs if not e.quarantine_reasons]
+        if not clean:
+            return 0
+
+        coll = DATASET_COLLECTIONS[dataset_id]
+        lo = min(e.event_time for e in clean)
+        hi = max(e.event_time for e in clean)
+        cursor = db[coll].find(
+            {"meta.dataset_id": dataset_id, "event_time": {"$gte": lo, "$lte": hi}},
+            {"event_time": 1},
+        )
+        existing = {d["event_time"] async for d in cursor}
+
+        fresh, seen = [], set()
+        for e in clean:
+            if e.event_time in existing or e.event_time in seen:
+                continue        # already stored, or duplicated within this batch
+            seen.add(e.event_time)
+            e.stage_latency_ms["store"] = self._last_store_ms.get(dataset_id, 0.0)
+            fresh.append(e)
+        if not fresh:
+            return 0
+
+        t0 = time.perf_counter()
+        await db[coll].insert_many([e.to_doc() for e in fresh])
+        elapsed = (time.perf_counter() - t0) * 1000
+        self._last_store_ms[dataset_id] = round(elapsed / len(fresh), 2)
+
+        newest = max(e.event_time for e in fresh)
+        last = self._last_written.get(dataset_id)
+        if last is None or newest > last:
+            self._last_written[dataset_id] = newest
+        for e in fresh:
+            telemetry.record_stored(dataset_id, e.ingest_time, e.event_time, backfill=True)
+        return len(fresh)

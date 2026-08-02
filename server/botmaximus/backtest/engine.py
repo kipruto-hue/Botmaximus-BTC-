@@ -21,6 +21,38 @@ from botmaximus.risk.state import Rejection, SizedOrder
 
 
 @dataclass
+class ExitPolicy:
+    """How a position is closed — supplied by the compiled DSL `exit` block, or
+    left at its defaults, which reproduce the pre-Pass-C behaviour exactly
+    (symmetric 1:1 target, global time stop).
+
+    The per-bar arrays are precomputed by the compiler rather than queried from
+    the strategy inside the replay loop. That keeps the engine ignorant of
+    features and regimes — it only indexes — and it keeps the point-in-time
+    guarantee in one place instead of spread across two layers.
+    """
+    target_r: float | None = 1.0            # reward:risk multiple; None = no target
+    time_exit_bars: int | None = None       # None → the engine's default
+    #: trailing stop distance in price units per 1m index; None disables trailing
+    trail_distance: list[float | None] | None = None
+    #: whether the bar's regime is inside the strategy's regime_scope
+    regime_ok: list[bool] | None = None
+
+    def trail_at(self, i: int) -> float | None:
+        if self.trail_distance is None or i >= len(self.trail_distance):
+            return None
+        return self.trail_distance[i]
+
+    def regime_valid_at(self, i: int) -> bool:
+        if self.regime_ok is None or i >= len(self.regime_ok):
+            return True
+        return self.regime_ok[i]
+
+
+DEFAULT_EXIT_POLICY = ExitPolicy()
+
+
+@dataclass
 class Trade:
     strategy_id: str
     direction: str
@@ -29,7 +61,7 @@ class Trade:
     entry_price: float          # actual fill (with slippage)
     exit_price: float
     qty: float
-    exit_reason: str            # "stop" | "target" | "time"
+    exit_reason: str            # "stop" | "target" | "time" | "trail" | "regime"
     gross_pnl: float
     fees: float
     funding: float
@@ -57,11 +89,14 @@ class BacktestResult:
 
 class Backtester:
     def __init__(self, cost_model: CostModel, risk: RiskCore,
-                 time_stop_bars: int | None = None):
+                 time_stop_bars: int | None = None,
+                 policy: ExitPolicy | None = None):
         self.costs = cost_model
         self.risk = risk
         self.latency = settings.latency_bars
         self.time_stop_bars = time_stop_bars or max(1, settings.holding_period_target_s // 60)
+        # No policy = the pre-Pass-C defaults, so existing callers are unchanged
+        self.policy = policy or DEFAULT_EXIT_POLICY
 
     def run(self, bars: list[Bar], strategy: Strategy, warmup: int = 60) -> BacktestResult:
         trades: list[Trade] = []
@@ -103,33 +138,57 @@ class Backtester:
     def _simulate(self, bars: list[Bar], signal_idx: int, direction: str,
                   sized: SizedOrder):
         """Fill at signal_idx + latency open, then walk forward to the exit."""
+        policy = self.policy
         entry_idx = signal_idx + self.latency
         entry_bar = bars[entry_idx]
         entry_fill = self.costs.fill_price(entry_bar.open, direction, "entry")
         qty = sized.qty
         stop = sized.intent.stop_price
-        # symmetric target at the intent's reward = risk distance (1:1) for the harness
+        long = direction == "LONG"
         stop_dist = abs(entry_fill - stop)
-        target = entry_fill + stop_dist if direction == "LONG" else entry_fill - stop_dist
+        target = None
+        if policy.target_r is not None:
+            reward = stop_dist * policy.target_r
+            target = entry_fill + reward if long else entry_fill - reward
 
-        last = min(len(bars) - 1, entry_idx + self.time_stop_bars)
+        horizon = policy.time_exit_bars or self.time_stop_bars
+        last = min(len(bars) - 1, entry_idx + horizon)
+        best = entry_fill                       # extreme reached in our favour
+        trailed = False                         # has the stop been ratcheted?
+
         for j in range(entry_idx, last + 1):
             bar = bars[j]
             if j == last:
                 exit_mid, reason = bar.close, "time"
-            elif direction == "LONG":
+            elif long:
                 if bar.low <= stop:                      # stop-first worst case
-                    exit_mid, reason = stop, "stop"
-                elif bar.high >= target:
+                    exit_mid, reason = stop, "trail" if trailed else "stop"
+                elif target is not None and bar.high >= target:
                     exit_mid, reason = target, "target"
+                elif not policy.regime_valid_at(j):
+                    exit_mid, reason = bar.close, "regime"
                 else:
+                    best = max(best, bar.high)
+                    trail = policy.trail_at(j)
+                    if trail is not None and best - trail > stop:
+                        # ratchet only — a trailing stop never loosens, and it
+                        # never moves below the original stop
+                        stop = best - trail
+                        trailed = True
                     continue
             else:
                 if bar.high >= stop:
-                    exit_mid, reason = stop, "stop"
-                elif bar.low <= target:
+                    exit_mid, reason = stop, "trail" if trailed else "stop"
+                elif target is not None and bar.low <= target:
                     exit_mid, reason = target, "target"
+                elif not policy.regime_valid_at(j):
+                    exit_mid, reason = bar.close, "regime"
                 else:
+                    best = min(best, bar.low)
+                    trail = policy.trail_at(j)
+                    if trail is not None and best + trail < stop:
+                        stop = best + trail
+                        trailed = True
                     continue
 
             exit_fill = self.costs.fill_price(exit_mid, direction, "exit")

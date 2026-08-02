@@ -34,6 +34,7 @@ from botmaximus.pipeline.quality.gate import QualityGate
 from botmaximus.pipeline.telemetry import telemetry
 from botmaximus.pipeline.writer import Writer
 from botmaximus.risk.core import RiskCore
+from botmaximus.strategy import store as strategy_store
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
     global risk_core
     await ensure_schema()
     await coverage.ensure_indexes()
+    await strategy_store.ensure_indexes()
 
     # risk core loads persisted equity/peak/kill state — a restart never resets it
     risk_core = RiskCore(mongo.get_db())
@@ -120,6 +122,56 @@ async def get_risk():
     if risk_core is None:
         return {"error": "risk core not initialised"}
     return risk_core.snapshot()
+
+
+@app.get("/api/strategies")
+async def get_strategies(state: str | None = None):
+    """The strategy population and where each one sits in its lifecycle.
+
+    Real, not simulated — but note what it is *not*: a claim that anything here
+    has an edge. `candidate` means proposed and parseable; only a strategy past
+    `candidate` has cleared the §5.5 gate, and in Pass C1 nothing is promoted
+    automatically.
+    """
+    states = [s.strip() for s in state.split(",")] if state else None
+    pop = await strategy_store.list_population(states)
+    counts: dict[str, int] = {}
+    for d in pop:
+        counts[d["lifecycle_state"]] = counts.get(d["lifecycle_state"], 0) + 1
+    return {
+        "count": len(pop),
+        "by_state": counts,
+        "strategies": [
+            {
+                "strategy_id": d["strategy_id"],
+                "version": d.get("version"),
+                "lifecycle_state": d["lifecycle_state"],
+                "origin": d.get("origin"),
+                "direction": d["definition"].get("direction"),
+                "regime_scope": d["definition"].get("regime_scope"),
+                "required_feeds": d["definition"].get("required_feeds"),
+                "rationale": d.get("rationale"),
+                "warnings": d.get("warnings", []),
+                "last_verdict": d.get("last_verdict"),
+                "updated_at": d["updated_at"].isoformat() if d.get("updated_at") else None,
+            }
+            for d in pop
+        ],
+    }
+
+
+@app.get("/api/strategies/{strategy_id}")
+async def get_strategy(strategy_id: str):
+    doc = await strategy_store.get(strategy_id)
+    if doc is None:
+        return {"error": "not_found", "strategy_id": strategy_id}
+    for k in ("created_at", "updated_at"):
+        if doc.get(k) is not None:
+            doc[k] = doc[k].isoformat()
+    history = await strategy_store.events(strategy_id)
+    for e in history:
+        e["at"] = e["at"].isoformat()
+    return {"strategy": doc, "events": history}
 
 
 @app.get("/api/coverage")

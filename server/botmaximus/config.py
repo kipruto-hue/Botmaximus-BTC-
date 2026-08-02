@@ -88,6 +88,22 @@ class Settings(BaseSettings):
     bt_min_regimes_positive: int = 2
     bt_candidate_trials: int = 1                # N trials for deflated-Sharpe correction
 
+    # ---- strategy DSL & generation (Strategy DSL Master Prompt §2) ----
+    # DSL-side params are set. Generator-side params are declared here but left
+    # unset on purpose: §2 requires the build to fail loudly rather than invent
+    # a value, and Pass C2 is where they get decided.
+    max_holding_bars_cap: int = 60          # DSL time_exit ceiling, 1m bars (1h)
+    default_time_exit_bars: int = 5         # ≈ holding_period_target_s
+    diversity_threshold: float = 0.85       # §5.7 similarity ceiling for dedupe
+    regime_vol_lookback: int = 60           # realised-vol window for the vol axis
+    regime_vol_ref_lookback: int = 1440     # trailing reference for high/low vol
+    vector_store: str = "chroma"            # §6.2 memory; operator lock 2026-07-23
+
+    generation_llm: str | None = None       # §2 GENERATION_LLM — C2, fail loudly
+    candidate_cap_per_cycle: int | None = None   # protects multiple-testing math
+    generation_cadence_s: int | None = None      # throttled to backtest throughput
+    decay_repair_trigger: str | None = None      # §7.1 sequential-test trigger
+
     # api
     api_host: str = "127.0.0.1"
     api_port: int = 8300

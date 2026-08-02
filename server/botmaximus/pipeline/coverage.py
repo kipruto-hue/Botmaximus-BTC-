@@ -101,6 +101,54 @@ async def reconcile_record_feed(feed: str, since: datetime | None = None) -> int
     return count
 
 
+async def reconcile_record_feed_bulk(feed: str, since: datetime | None = None,
+                                     batch: int = 50_000) -> int:
+    """Bulk reconcile for deep history — same ledger, same `snap_slot` grid.
+
+    `reconcile_record_feed` does a read plus a write per record, which is right
+    for healing a handful of slots but is 2 × 10^6 round-trips against two years
+    of 1m candles. This batches the same upserts.
+
+    Dropping the per-slot read is safe *only* because this path writes nothing
+    but COMPLETE: `mark`'s guard exists to stop a complete slot being downgraded,
+    and an upsert to COMPLETE can never downgrade anything.
+    """
+    from pymongo import UpdateOne
+
+    if feed not in RECORD_BACKED_FEEDS:
+        raise ValueError(f"{feed} is not record-backed")
+    coll_name, granularity_s = RECORD_BACKED_FEEDS[feed]
+    db = get_db()
+    query = {"event_time": {"$gte": since}} if since is not None else {}
+
+    now = datetime.now(timezone.utc)
+    ops: list = []
+    seen: set[datetime] = set()
+    count = 0
+    cursor = db[coll_name].find(query, {"event_time": 1}).sort("event_time", 1)
+    async for doc in cursor:
+        slot = snap_slot(doc["event_time"], granularity_s)
+        if slot in seen:                    # many records can share one slot
+            continue
+        seen.add(slot)
+        ops.append(UpdateOne(
+            {"feed": feed, "slot": slot},
+            {"$set": {"feed": feed, "slot": slot, "state": COMPLETE,
+                      "source": "record", "updated_at": now}},
+            upsert=True,
+        ))
+        if len(ops) >= batch:
+            await db[COVERAGE_COLLECTION].bulk_write(ops, ordered=False)
+            count += len(ops)
+            ops = []
+            seen.clear()
+    if ops:
+        await db[COVERAGE_COLLECTION].bulk_write(ops, ordered=False)
+        count += len(ops)
+    log.info("coverage: reconciled %d slots for %s", count, feed)
+    return count
+
+
 async def gaps(feed: str, start: datetime, end: datetime) -> list[datetime]:
     """Slots in [start, end] NOT marked complete. This is what the backtester
     calls to decide whether a window is safe to evaluate."""

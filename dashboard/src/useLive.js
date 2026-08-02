@@ -5,12 +5,16 @@ import { useEffect, useRef, useState } from "react";
  * Primary: websocket /ws/live (telemetry snapshot every ~1.5s).
  * Fallback: poll /api/telemetry every 2.5s when the socket is down.
  * Risk: poll /api/risk every 3s (real equity, drawdown, limits, kill stack).
- * Returns { connected, snap, risk } — snap/risk are the server payloads or null.
+ * Strategies: poll /api/strategies every 10s (real population + lifecycle
+ *   state). It changes only when a strategy is validated or retired, so a
+ *   fast poll would just be noise.
+ * Returns { connected, snap, risk, strategies } — server payloads or null.
  */
 export default function useLive() {
   const [connected, setConnected] = useState(false);
   const [snap, setSnap] = useState(null);
   const [risk, setRisk] = useState(null);
+  const [strategies, setStrategies] = useState(null);
   const wsRef = useRef(null);
 
   useEffect(() => {
@@ -34,8 +38,20 @@ export default function useLive() {
         }
       } catch { /* engine down — risk stays null → panels fall back to SIM */ }
     };
+    const pollStrategies = async () => {
+      try {
+        const r = await fetch("/api/strategies");
+        if (r.ok && alive) {
+          const j = await r.json();
+          setStrategies(j.error ? null : j);
+        }
+      } catch { /* engine down — population stays null → panel shows SIM */ }
+    };
+
     pollRisk();
+    pollStrategies();
     const riskTimer = setInterval(pollRisk, 3000);
+    const stratTimer = setInterval(pollStrategies, 10000);
 
     const connect = () => {
       if (!alive) return;
@@ -64,9 +80,10 @@ export default function useLive() {
       clearTimeout(retryTimer);
       if (pollTimer) clearInterval(pollTimer);
       clearInterval(riskTimer);
+      clearInterval(stratTimer);
       wsRef.current?.close();
     };
   }, []);
 
-  return { connected, snap, risk };
+  return { connected, snap, risk, strategies };
 }

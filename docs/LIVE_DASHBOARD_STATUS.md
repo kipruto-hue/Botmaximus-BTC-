@@ -29,7 +29,8 @@ nothing.
 | Risk to kill (drawdown gauge) | **WAS FAKE → now REAL** | `/api/risk` (see §5) |
 | Account (equity, day P&L, limits, kill stack) | **WAS FAKE → now REAL** | `/api/risk` (see §5) |
 | Open positions | **SIMULATED** | `Math.random()` — no execution engine exists |
-| Strategy pool (allocations, decay) | **SIMULATED** | `Math.random()` — no strategies exist |
+| Strategy pool — population list + lifecycle state | **REAL** (Pass C1) | `/api/strategies` — the real population and its states |
+| Strategy pool — allocations, decay % | **SIMULATED** | `Math.random()` — no capital is allocated, no decay monitor exists |
 | Scrutiny feed ("reasoning · live") | **SIMULATED** | `Math.random()` — no LLM, no gate exists |
 | World state (FOMC/CPI events, posture) | **SIMULATED** | hard-coded fake events |
 
@@ -179,7 +180,8 @@ that loop are built bottom-up and only two of six exist:
 |---|---|---|
 | A · Risk core | hard limits, sizing, kill stack | **BUILT** |
 | B · Backtest harness | prove/reject an edge on real history | **BUILT** |
-| C · Strategy DSL + lifecycle | the strategies themselves | not built (blocked, see below) |
+| C1 · Strategy DSL + feature layer + lifecycle | the language strategies are written in, and its safety boundary | **BUILT** |
+| C2 · Generator + decay/repair loop | GPT-5.5 proposing inside the DSL | not built |
 | D · Arbiter | resolve conflicting strategy signals | not built |
 | E · Scrutiny gate | LLM veto using historical analogs | not built |
 | F · Paper execution | actually place simulated orders | not built |
@@ -215,9 +217,31 @@ Past data enters this loop in two distinct places:
    store, and may **veto** the trade (it can never create or enlarge one). This
    is how past data will influence *individual live decisions*.
 
-Neither path is active yet. Layer C is **blocked** on one missing input: the
-**System Master Prompt v1.1** (the "constitution" that defines the strategy
-schema), which has not been provided.
+Path 1 is now **built** (Pass C1) but is not yet feeding anything: strategies
+can be written, validated and backtested, but nothing is promoted to capital
+automatically and no generator is proposing new ones. Path 2 remains unbuilt.
+
+### What Pass C1 added (2026-08-02)
+
+- A **feature layer** (`server/botmaximus/features/`) — the only thing a
+  strategy may read. Higher timeframes are projected from 1m bars through a
+  fully-closed-bar map, and non-OHLCV feeds join *backwards* onto the bar grid.
+  Both properties are tested by rewriting every future bar and asserting nothing
+  in the past moves.
+- The **DSL** (`server/botmaximus/strategy/`) — a declarative grammar with no
+  arithmetic, no function calls, and no term type that can name a bar index.
+  There is no size field and `exit.stop` is required, so an unsized or stopless
+  strategy does not parse. Parsing is strict: an unknown key is a rejection, not
+  something quietly ignored.
+- **5 seed strategies** (§8.1 themes), a **validator** producing typed rejection
+  reasons, a **compiler** producing the same object for backtest and live, and a
+  **lifecycle** in which leaving `candidate` requires a passing validation
+  verdict and `retired` is terminal.
+- **2 years of 1m OHLCV** (1,051,199 candles) backfilled, because 30 trades
+  across ≥2 regimes and 4 walk-forward folds is unreachable on a 7-day window.
+
+What C1 deliberately does **not** do: judge, promote, or allocate. Those live
+in the backtest gate, the lifecycle, and the risk core respectively.
 
 ---
 
@@ -239,9 +263,10 @@ real decay breach → the strategy is **down-weighted, then retired**; a retired
 strategy can spawn a *repaired* successor that must re-pass the full validation
 gate from scratch (a repair is a new strategy, not a patched live one).
 
-On the dashboard today the "decay 41% ↯repair" numbers are **random noise** —
-there is no strategy behind them. When Layer C is built, these will reflect the
-real sequential decay test.
+On the dashboard today the "decay 41% ↯repair" numbers are still **random
+noise** — the decay monitor is Pass C2 work. The lifecycle *states* beside them
+are now real (Pass C1): the transitions are enforced, audited in
+`strategy_events`, and `retired` genuinely cannot be undone.
 
 ---
 
@@ -256,5 +281,8 @@ real sequential decay test.
   imbalance) is exactly what will make that future layer adaptive rather than a
   static one-signal bot. But the intelligence itself is unbuilt.
 
-**Next unblock:** provide the **System Master Prompt v1.1** to start Layer C
-(strategies), which is what turns the honest-but-static system into a real one.
+**Next:** Pass C2 — the GPT-5.5 generator proposing inside the now-closed DSL,
+plus the decay-diagnosis and repair loop (§6–§7 of the Strategy DSL Master
+Prompt). Its open parameters (`GENERATION_LLM`, `CANDIDATE_CAP_PER_CYCLE`,
+`GENERATION_CADENCE`, `DECAY_REPAIR_TRIGGER`) are declared in `config.py` but
+deliberately left unset — §2 requires failing loudly rather than inventing them.

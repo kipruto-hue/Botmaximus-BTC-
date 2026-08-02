@@ -13,14 +13,34 @@ from botmaximus.backtest.validation import ValidationVerdict
 
 BACKTEST_RUNS_COLLECTION = "backtest_runs"
 
+#: The equity curve carries one point per evaluated bar, so a multi-year 1m
+#: window is ~10^6 points and blows past Mongo's 16MB document limit. It is a
+#: display artefact — the trade list is the reproducible record, and the curve
+#: can be rebuilt from it — so it is stored downsampled rather than dropped.
+MAX_CURVE_POINTS = 5_000
+
 
 def config_hash(config: dict) -> str:
     blob = json.dumps(config, sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+def downsample_curve(curve: list, max_points: int = MAX_CURVE_POINTS) -> tuple[list, int]:
+    """Stride the curve down to `max_points`, always keeping the last point so
+    the final equity is exact. Returns (points, stride)."""
+    n = len(curve)
+    if n <= max_points:
+        return list(curve), 1
+    stride = (n + max_points - 1) // max_points
+    out = curve[::stride]
+    if out[-1] is not curve[-1]:
+        out.append(curve[-1])
+    return out, stride
+
+
 def build_run_doc(strategy_id: str, config: dict, coverage_summary: dict,
                   result: BacktestResult, verdict: ValidationVerdict) -> dict:
+    curve, stride = downsample_curve(result.equity_curve)
     return {
         "strategy_id": strategy_id,
         "config_hash": config_hash(config),
@@ -30,7 +50,9 @@ def build_run_doc(strategy_id: str, config: dict, coverage_summary: dict,
         "verdict": {"passed": verdict.passed, "reasons": verdict.reasons},
         "metrics": verdict.metrics,
         "params": result.params,
-        "equity_curve": [[t.isoformat(), round(e, 2)] for t, e in result.equity_curve],
+        "equity_curve_points": len(result.equity_curve),
+        "equity_curve_stride": stride,       # 1 = full resolution
+        "equity_curve": [[t.isoformat(), round(e, 2)] for t, e in curve],
         "trades": [
             {
                 "direction": t.direction,

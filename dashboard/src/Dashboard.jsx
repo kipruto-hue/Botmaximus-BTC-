@@ -95,7 +95,7 @@ function RiskGauge({ dd, kill }) {
 
 /* ============================ main ============================ */
 export default function Dashboard() {
-  const { connected, snap, risk } = useLive();
+  const { connected, snap, risk, strategies } = useLive();
 
   const [running, setRunning] = useState(true);
   const [confirmKill, setConfirmKill] = useState(false);
@@ -207,6 +207,21 @@ export default function Dashboard() {
   const openRiskUsd = risk?.open_risk_usd ?? 0;
   const openRiskPct = equity ? (openRiskUsd / equity) * 100 : 0;
   const riskPerTrade = risk?.limits?.risk_per_trade_pct ?? 0.25;
+
+  /* ---- REAL strategy population (/api/strategies), Pass C1. --------------
+     The list and each lifecycle state are real. Allocation and decay are NOT:
+     no capital is allocated and no decay monitor exists yet (Pass C2), so
+     those two columns stay simulated and stay badged. ---------------------- */
+  const stratsLive = !!strategies?.strategies?.length;
+  const stratRows = stratsLive
+    ? strategies.strategies.map((s) => ({
+        id: s.strategy_id,
+        state: s.lifecycle_state,
+        direction: s.direction,
+        passed: s.last_verdict?.passed ?? null,
+        reason: (s.last_verdict?.reasons || [])[0] || null,
+      }))
+    : strats;
   const kstack = risk?.kills;
   const killState = kstack?.l3_killed ? "L3 KILLED" : kstack?.l2_halted ? "L2 HALTED"
     : (kstack && Object.keys(kstack.l1_suspended || {}).length) ? "L1 active" : "all clear";
@@ -381,12 +396,29 @@ export default function Dashboard() {
             )}
           </Panel>
 
-          <Panel title="Strategy pool" icon={<Cpu size={14} color={C.mut} />} sim
-            right={<span style={{ fontFamily: F.mono, fontSize: 10, color: C.dim }}>{strats.filter(s => s.alloc > 0).length} live · {strats.length} tracked</span>}
+          <Panel title="Strategy pool" icon={<Cpu size={14} color={C.mut} />} sim={!stratsLive}
+            right={<span style={{ fontFamily: F.mono, fontSize: 10, color: C.dim }}>
+              {stratsLive
+                ? `${stratRows.length} in population · 0 allocated`
+                : `${strats.filter(s => s.alloc > 0).length} live · ${strats.length} tracked`}
+            </span>}
             style={{ minHeight: 150 }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-              {strats.map((s) => {
-                const L = LIFECYCLE[s.state];
+              {stratRows.map((s) => {
+                const L = LIFECYCLE[s.state] || LIFECYCLE.candidate;
+                if (stratsLive) {
+                  // real row: id, lifecycle state, direction, last gate verdict
+                  return (
+                    <div key={s.id} style={{ display: "grid", gridTemplateColumns: "1fr 62px 46px 128px", gap: 10, alignItems: "center" }}>
+                      <span style={{ fontFamily: F.mono, fontSize: 11, color: C.txt, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.id}>{s.id}</span>
+                      <span style={{ fontFamily: F.mono, fontSize: 9.5, color: L.c, border: `1px solid ${L.c}44`, borderRadius: 3, padding: "1px 5px", textAlign: "center", letterSpacing: 0.5 }}>{L.label}</span>
+                      <span style={{ fontFamily: F.mono, fontSize: 9.5, color: C.dim, textAlign: "center" }}>{s.direction === "short" ? "SHORT" : "LONG"}</span>
+                      <span style={{ fontFamily: F.mono, fontSize: 9.5, color: s.passed === true ? C.grn : s.passed === false ? C.red : C.dim, textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.reason || ""}>
+                        {s.passed === true ? "gate: PASS" : s.passed === false ? `gate: ${s.reason || "REJECTED"}` : "not yet tested"}
+                      </span>
+                    </div>
+                  );
+                }
                 const dying = s.decay > 0.6;
                 return (
                   <div key={s.id} style={{ display: "grid", gridTemplateColumns: "128px 62px 1fr 96px", gap: 10, alignItems: "center" }}>
@@ -403,6 +435,12 @@ export default function Dashboard() {
                 );
               })}
             </div>
+            {stratsLive && (
+              <div style={{ fontFamily: F.mono, fontSize: 9, color: C.dim, marginTop: 9, lineHeight: 1.5 }}>
+                real population + lifecycle state · allocation and decay% are not
+                shown because no capital is allocated and no decay monitor exists yet
+              </div>
+            )}
           </Panel>
         </div>
 
