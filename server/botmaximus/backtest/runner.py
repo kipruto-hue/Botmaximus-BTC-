@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from botmaximus.backtest import data, store
+from botmaximus.backtest import data, holdout, store
 from botmaximus.backtest.costs import CostModel
 from botmaximus.backtest.engine import Backtester
 from botmaximus.backtest.regimes import build_regime_map, regime_lookup
@@ -71,7 +71,7 @@ async def run_backtest(strategy: Strategy, start: datetime, end: datetime,
 
 async def run_dsl_backtest(defn, start: datetime, end: datetime,
                            allow_gaps: bool = False, warmup: int = 200,
-                           persist: bool = True) -> dict:
+                           persist: bool = True, holdout_run: bool = False) -> dict:
     """Gate 3 path: a validated StrategyDefinition → compiled → replayed →
     judged. The strategy is compiled against the *same* MarketWindow the replay
     walks, so features and bars cannot disagree about what happened when.
@@ -80,8 +80,20 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
     features need many 1m bars before their first value exists (a 1h ADX(14)
     needs 2×14 closed 1h bars ≈ 1,680 minutes), and trading on a warmup-thin
     feature is trading on an artefact.
+
+    `holdout_run=True` spends this strategy's single evaluation on the sealed
+    window. The default path is refused if it reaches into that window at all.
+    Either way the evaluation is recorded in the lifetime trial ledger, and the
+    deflated Sharpe is corrected against the ledger's count rather than the
+    `bt_candidate_trials` fallback — which is 1, and at 1 there is no correction.
     """
+    from botmaximus.strategy import trials
     from botmaximus.strategy.compiler import compile_strategy
+
+    if holdout_run:
+        await holdout.assert_unburned(defn.id)
+    else:
+        holdout.assert_outside(start, end)
 
     coverage_summaries = {}
     for feed in defn.required_feeds:
@@ -103,9 +115,6 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
                     policy=strategy.exit_policy)
     result = bt.run(market.bars, strategy, warmup=warmup)
 
-    regime_of = regime_lookup(build_regime_map(market.bars))
-    verdict = validate(result, regime_of)
-
     config = {
         "strategy_id": defn.id,
         "definition": defn.to_dict(),
@@ -115,14 +124,30 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
         "slippage_bps": settings.slippage_bps,
         "latency_bars": settings.latency_bars,
         "min_trades": settings.bt_min_trades,
-        "candidate_trials": settings.bt_candidate_trials,
+        "holdout": holdout_run,
         # part of the hash: changing the confirmation window changes the trades,
         # so two runs under different values must not collide
         "regime_confirm_bars": settings.regime_invalidation_confirm_bars,
     }
+    # Registered before judging, so a run that fails downstream has still been
+    # counted — the data was looked at either way, and that is what a trial is.
+    # `n_trials` is deliberately NOT in the hashed config: it is an outcome of
+    # the ledger, and folding it in would change the hash on every single run
+    # and defeat the replay-dedupe the hash exists for.
+    n_trials = await trials.record(defn, store.config_hash(config))
+
+    regime_of = regime_lookup(build_regime_map(market.bars))
+    verdict = validate(result, regime_of, n_trials=n_trials)
+
     doc = store.build_run_doc(defn.id, config, coverage_summaries, result, verdict)
+    doc["n_trials"] = n_trials
+    doc["holdout"] = holdout_run
     if persist:
         await store.save_run(doc)
+    if holdout_run:
+        await holdout.record_burn(
+            defn.id, {"passed": verdict.passed, "reasons": verdict.reasons},
+            (start, end))
 
     exits: dict[str, int] = {}
     for t in result.trades:
@@ -135,4 +160,6 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
         "coverage": coverage_summaries,
         "exit_reasons": exits,
         "signals": sum(1 for s in strategy.signals if s),
+        "n_trials": n_trials,
+        "holdout": holdout_run,
     }

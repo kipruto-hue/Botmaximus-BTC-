@@ -18,9 +18,10 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from botmaximus.backtest import holdout
 from botmaximus.backtest.runner import run_dsl_backtest
 from botmaximus.features.registry import FEED_HISTORY_DAYS
-from botmaximus.strategy import lifecycle, store
+from botmaximus.strategy import lifecycle, store, trials
 from botmaximus.strategy.schema import StrategyDefinition
 from botmaximus.strategy.seeds import seed_definitions
 from botmaximus.strategy.validator import validate
@@ -54,7 +55,12 @@ async def run(days: int, warmup: int, persist: bool = True,
     has holes, and moving the boundary is the honest fix — widening the gate is
     not."""
     await store.ensure_indexes()
+    await trials.ensure_indexes()
     end = end or datetime.now(timezone.utc) - timedelta(minutes=5)
+    # The seed gate is a *search* path, so it stops at the sealed window. Clip
+    # rather than refuse: an operator asking for 365 days wants the largest legal
+    # 365 days, and a hard error here would only teach them to pass --end by hand.
+    end = holdout.clip_end(end)
     results: list[dict] = []
 
     for defn in seed_definitions():
@@ -85,6 +91,7 @@ async def run(days: int, warmup: int, persist: bool = True,
             "signals": out["signals"], "exit_reasons": out["exit_reasons"],
             "window": [start.date().isoformat(), stop.date().isoformat()],
             "window_note": note, "warnings": res.warnings,
+            "n_trials": out.get("n_trials"),
         })
 
         # record the outcome — a rejection is kept, not deleted: its reasons are
@@ -118,7 +125,8 @@ def report(results: list[dict]) -> None:
             if m["gross_pnl"]:
                 line += f"   ({abs(m['friction'] / m['gross_pnl']):.1f}x gross)"
             print(line)
-            print(f"  DSR      : {m['deflated_sharpe']}   maxDD: {m['max_drawdown_pct']}%")
+            print(f"  DSR      : {m['deflated_sharpe']}   maxDD: {m['max_drawdown_pct']}%"
+                  f"   (corrected for {r.get('n_trials')} lifetime trials)")
             print(f"  regimes  : {m['positive_regimes']} positive  {m['regime_expectancy']}")
             print(f"  walkfwd  : {m['walk_forward']['positive_folds']}"
                   f"/{m['walk_forward']['folds']} folds positive")

@@ -83,10 +83,21 @@ class Settings(BaseSettings):
     bt_walkforward_folds: int = 4
     bt_purge_bars: int = 5                      # ≈ holding period; drop label-overlapping samples
     bt_embargo_bars: int = 5
-    bt_min_trades: int = 30                     # statistical power floor
+    # Statistical power floor. Was 30, which cleared four of five Gate-3 seeds:
+    # a Sharpe estimated from 30 trades has a standard error wide enough to be
+    # uninformative, and paired with an uncorrected DSR that made the gate leaky
+    # from both ends. At ~5-minute holds trades are cheap; this costs only window.
+    bt_min_trades: int = 200
     bt_max_drawdown_pct: float = 25.0
     bt_min_regimes_positive: int = 2
-    bt_candidate_trials: int = 1                # N trials for deflated-Sharpe correction
+    # Fallback only, for callers with no ledger (unit tests, the ad-hoc OHLCV
+    # path). The real count comes from `strategy.trials` — a persistent lifetime
+    # ledger. Note `expected_max_sharpe` returns a 0.0 benchmark at n<=1, so this
+    # value DISABLES the correction; it must never be the production source.
+    bt_candidate_trials: int = 1
+    # Most-recent slice sealed from the search path (§ backtest/holdout.py).
+    # The generator never reads it; a strategy may be judged on it once.
+    holdout_days: int = 90
 
     # ---- strategy DSL & generation (Strategy DSL Master Prompt §2) ----
     # DSL-side params are set. Generator-side params are declared here but left

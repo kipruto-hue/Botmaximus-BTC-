@@ -3,6 +3,10 @@
 Where the cracks form, ordered by *when* they bite. Written 2026-08-02 at
 `main @ b836c1d` (Passes A/B/C1 complete, C2 not started).
 
+> **Status 2026-08-02, post-hardening:** §1.1 (trial ledger), §1.3 (sealed
+> holdout) and §1.4 (trade floor) are **CLOSED** — see the addendum at the foot
+> of this file for what was built and what it changed. Everything else stands.
+
 This is not a list of bugs. Bugs are found by tests; these are properties of the
 design that are currently correct and will *become* wrong as the system grows
 into its next stage. Each one names the code that carries it.
@@ -229,3 +233,62 @@ called an edge.
 | 5 | Predicted-vs-realized trade ledger | a day | §7 can tell decay from mis-modelling |
 | 6 | Raise `bt_min_trades` to ~200 | minutes | Real statistical power |
 | 7 | Define kill-with-open-position semantics | discussion | Not being fully exposed during a kill |
+
+---
+
+# Addendum — pre-C2 hardening, 2026-08-02
+
+Items 1, 4 and 6 of that table are done. All three had to land *before* C2's
+first candidate: every verdict issued under the old gate would otherwise have
+needed re-running, and a trial count cannot be reconstructed after the fact.
+
+### `strategy/trials.py` — lifetime trial ledger (closes §1.1)
+One trial = one (structural signature, config hash) ever evaluated, persisted in
+`trial_ledger`, never reset. `run_dsl_backtest` registers the evaluation *before*
+judging it and feeds the count to `validate(n_trials=…)`, so the deflated Sharpe
+is finally corrected against real search intensity instead of the constant 1
+that made `expected_max_sharpe` return a 0.0 benchmark.
+
+Two judgement calls, both erring toward rejecting:
+- **Total evaluations, not distinct ideas.** Fifty variants of one idea are fifty
+  looks at the data. Because those variants are correlated this slightly
+  over-corrects — the right direction of error for a gate whose job is to reject.
+  Distinct signatures are tracked separately, for reporting only.
+- **An identical re-run is not a trial.** Keyed on config hash, so restarts,
+  retries and dev re-runs don't inflate the count. Anything that differs does.
+
+There is deliberately no reset, clear or decrement entry point, and a test
+asserts the module never grows one.
+
+### `backtest/holdout.py` — sealed window (closes §1.3)
+The most recent `holdout_days` (90) is invisible to the search path:
+`run_dsl_backtest` refuses any window reaching into it, and `seed_gate` clips its
+end to the boundary. A strategy may be judged on it **once**, via
+`holdout_run=True`; the burn is written to `strategy_events` before the verdict
+is returned, so a run that dies afterwards has still spent it. A failing verdict
+burns it too — the window is consumed by *looking*, not by passing.
+
+### `bt_min_trades` 30 → 200 (closes §1.4)
+Immediately visible: two seeds that were previously judged on merit now reject on
+`insufficient_trades:30<200` and `44<200`.
+
+### What the hardened gate did to Gate 3
+Windows moved to 2025-05-05 → 2026-05-05. Still 0/5, with better-founded
+rejections. One genuine improvement and one new problem:
+
+- **`seed_funding_extreme_contrarian` became evaluable.** It was previously
+  refused on coverage because `btc_funding_8h` has been gappy since 2026-07-29 —
+  which now falls *inside* the sealed window. Sealing the recent past
+  incidentally routes the search around the freshest collector outages.
+- **`seed_oi_divergence_exhaustion` got worse: `btc_oi_5m` 8353/8353 missing.**
+  A real structural conflict, not a bug. `openInterestHist` has a hard 30-day
+  venue limit, so stored OI history only extends back as far as the collector has
+  been running. With the search path pushed 90 days into the past, the OI window
+  lands entirely before any OI was ever collected.
+
+  **Any feed whose accumulated history is shorter than `holdout_days` plus a
+  usable window is unevaluable.** Today that is OI; it also would be liquidations
+  and order book. It resolves itself as the collector accumulates history — but
+  *only* if uptime holds, which makes §3.1 more load-bearing than it already was.
+  The alternative is shortening `holdout_days`, which is an operator tradeoff
+  between out-of-sample honesty and feed coverage, not a code decision.
