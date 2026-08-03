@@ -97,6 +97,12 @@ class Settings(BaseSettings):
     diversity_threshold: float = 0.85       # §5.7 similarity ceiling for dedupe
     regime_vol_lookback: int = 60           # realised-vol window for the vol axis
     regime_vol_ref_lookback: int = 1440     # trailing reference for high/low vol
+    # Bars the regime label must stay out-of-scope before an open position is
+    # invalidated. On the 1m grid the 6-bucket label flips constantly; at 1 the
+    # Gate-3 trend seed exited on `regime` 307 times in 336 trades, paying a
+    # taker fee for each flicker. Not a DSL field — it is a friction control the
+    # operator owns, not a strategy choice the generator may tune.
+    regime_invalidation_confirm_bars: int = 5
     vector_store: str = "chroma"            # §6.2 memory; operator lock 2026-07-23
 
     generation_llm: str | None = None       # §2 GENERATION_LLM — C2, fail loudly

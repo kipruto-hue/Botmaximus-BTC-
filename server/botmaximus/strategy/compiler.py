@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from botmaximus.backtest.data import MarketWindow, PointInTimeView
+from botmaximus.config import settings
 from botmaximus.backtest.engine import ExitPolicy
 from botmaximus.features.compute import FeatureContext, FeatureRef
 from botmaximus.risk.state import OrderIntent
@@ -232,6 +233,7 @@ def compile_strategy(defn: StrategyDefinition, market: MarketWindow) -> Compiled
         # regime_ok is always supplied so `evaluate` can gate entries on scope;
         # only regime_invalidation decides whether it also closes a live position
         regime_ok=regime_ok if defn.exit.regime_invalidation else None,
+        regime_confirm_bars=settings.regime_invalidation_confirm_bars,
     )
     return CompiledStrategy(
         id=defn.id,

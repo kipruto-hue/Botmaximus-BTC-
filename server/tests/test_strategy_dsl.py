@@ -605,6 +605,51 @@ def test_stop_still_wins_over_regime_invalidation():
     assert res.trades[0].exit_reason == "stop"
 
 
+def test_flickering_regime_does_not_close_the_position():
+    """The Gate-3 defect: on the 1m grid the 6-bucket label alternates, and at
+    confirm=1 every flicker closed the position and paid a taker exit fee."""
+    bars = mkbars(400, lambda i: 100.0)
+    ok = [i % 2 == 0 for i in range(400)]        # out-of-scope every other bar
+    churn = _run_with(ExitPolicy(target_r=1.0, time_exit_bars=100,
+                                 regime_ok=ok, regime_confirm_bars=1), bars)
+    calm = _run_with(ExitPolicy(target_r=1.0, time_exit_bars=100,
+                                regime_ok=ok, regime_confirm_bars=5), bars)
+    assert churn.trades[0].exit_reason == "regime"
+    assert calm.trades[0].exit_reason != "regime"
+
+
+def test_regime_closes_once_the_streak_is_confirmed():
+    """A sustained departure still closes — confirmation delays it by exactly
+    the confirmation window, it does not disable the exit."""
+    bars = mkbars(400, lambda i: 100.0)
+    ok = [True] * 400
+    for i in range(70, 400):
+        ok[i] = False
+    res = _run_with(ExitPolicy(target_r=1.0, time_exit_bars=100,
+                               regime_ok=ok, regime_confirm_bars=5), bars)
+    assert res.trades[0].exit_reason == "regime"
+    early = _run_with(ExitPolicy(target_r=1.0, time_exit_bars=100,
+                                 regime_ok=ok, regime_confirm_bars=1), bars)
+    assert res.trades[0].exit_time > early.trades[0].exit_time
+
+
+def test_regime_confirmation_resets_on_a_single_bar_back_in_scope():
+    policy = ExitPolicy(regime_ok=[False] * 10, regime_confirm_bars=3)
+    assert policy.regime_valid_at(1) is True        # streak not yet confirmed
+    assert policy.regime_valid_at(2) is False       # bars 0,1,2 out of scope
+    policy.regime_ok[2] = True                      # one bar back in scope
+    assert policy.regime_valid_at(4) is True        # count restarted at bar 3
+
+
+def test_regime_confirmation_never_infers_a_streak_from_missing_bars():
+    """A window opening mid-streak has not observed a confirmed departure;
+    inferring one from absent bars is the phantom-coverage error again."""
+    policy = ExitPolicy(regime_ok=[False] * 10, regime_confirm_bars=5)
+    assert policy.regime_valid_at(0) is True
+    assert policy.regime_valid_at(3) is True
+    assert policy.regime_valid_at(4) is False
+
+
 # =====================================================================
 # Lifecycle
 # =====================================================================

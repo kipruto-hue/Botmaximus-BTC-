@@ -116,6 +116,9 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
         "latency_bars": settings.latency_bars,
         "min_trades": settings.bt_min_trades,
         "candidate_trials": settings.bt_candidate_trials,
+        # part of the hash: changing the confirmation window changes the trades,
+        # so two runs under different values must not collide
+        "regime_confirm_bars": settings.regime_invalidation_confirm_bars,
     }
     doc = store.build_run_doc(defn.id, config, coverage_summaries, result, verdict)
     if persist:

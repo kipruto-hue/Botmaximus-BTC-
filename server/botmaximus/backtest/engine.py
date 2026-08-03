@@ -37,6 +37,10 @@ class ExitPolicy:
     trail_distance: list[float | None] | None = None
     #: whether the bar's regime is inside the strategy's regime_scope
     regime_ok: list[bool] | None = None
+    #: consecutive out-of-scope bars required before a live position is closed.
+    #: 1 = close on the first flicker (the Gate-3 behaviour that made `regime`
+    #: the dominant exit reason and paid a taker fee per flip).
+    regime_confirm_bars: int = 1
 
     def trail_at(self, i: int) -> float | None:
         if self.trail_distance is None or i >= len(self.trail_distance):
@@ -44,9 +48,20 @@ class ExitPolicy:
         return self.trail_distance[i]
 
     def regime_valid_at(self, i: int) -> bool:
+        """Invalid only once the label has been out-of-scope for
+        `regime_confirm_bars` consecutive bars ending at `i`. A single bar back
+        in scope resets the count, so a flickering label never closes anything.
+
+        Bars before the array starts are treated as in-scope: a window that
+        opens mid-streak has not *observed* a confirmed exit, and inferring one
+        from absent data is the same class of error as phantom coverage.
+        """
         if self.regime_ok is None or i >= len(self.regime_ok):
             return True
-        return self.regime_ok[i]
+        n = max(1, self.regime_confirm_bars)
+        if i + 1 < n:
+            return True
+        return any(self.regime_ok[i - n + 1:i + 1])
 
 
 DEFAULT_EXIT_POLICY = ExitPolicy()
