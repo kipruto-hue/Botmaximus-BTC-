@@ -1,0 +1,19 @@
+[Unit]
+Description=BOTMAXIMUS database backup
+After=mongod.service
+
+[Service]
+Type=oneshot
+User=botmaximus
+WorkingDirectory=/opt/botmaximus
+# --keep prunes to the 7 newest AFTER a successful verified dump, so a failing
+# backup can never delete the last good one.
+#
+# BACKUP_DEST must point somewhere that is not this machine's disk. A backup on
+# the same device protects against a mistaken drop and nothing else -- and disk
+# loss is the failure that takes the whole 2-year history, most of which
+# (liquidations, order book, open interest beyond 30 days) cannot be re-fetched
+# from any venue endpoint at any price.
+EnvironmentFile=/etc/botmaximus/backup.env
+ExecStart=/opt/botmaximus/server/.venv/bin/python /opt/botmaximus/ops/mongo_backup.py dump --dest ${BACKUP_DEST} --keep 7
+SyslogIdentifier=botmaximus-backup

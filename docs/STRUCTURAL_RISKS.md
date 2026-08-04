@@ -6,6 +6,11 @@ Where the cracks form, ordered by *when* they bite. Written 2026-08-02 at
 > **Status 2026-08-02, post-hardening:** §1.1 (trial ledger), §1.3 (sealed
 > holdout) and §1.4 (trade floor) are **CLOSED** — see the addendum at the foot
 > of this file for what was built and what it changed. Everything else stands.
+>
+> **Status 2026-08-04:** §3.2 (no backup) is **CLOSED**. §3.1 (uptime) is
+> **MITIGATED, NOT CLOSED** — supervision now restarts on silence rather than
+> only on death, but it still starts at logon on a desktop that sleeps. See
+> `OPERATIONS.md`; the VPS path is written and not yet provisioned.
 
 This is not a list of bugs. Bugs are found by tests; these are properties of the
 design that are currently correct and will *become* wrong as the system grows

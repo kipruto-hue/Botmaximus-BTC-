@@ -1,0 +1,16 @@
+[Unit]
+Description=BOTMAXIMUS freshness watchdog
+# systemd restarts a process that DIES. This restarts one that has gone SILENT
+# -- the 2026-04-23 Binance routing failure kept the socket connected, acked
+# SUBSCRIBE and delivered nothing, which Restart=always cannot see. For
+# liquidations and order book, which have no history endpoint, every silent
+# hour is permanently lost data.
+After=botmaximus.service
+
+[Service]
+Type=oneshot
+User=root
+# Exit 0 healthy, 1 stale/degraded, 2 unreachable. Restart on either failure:
+# an API that stopped answering is as bad as one reporting stale feeds.
+ExecStart=/bin/sh -c '/opt/botmaximus/server/.venv/bin/python /opt/botmaximus/ops/healthcheck.py --url http://127.0.0.1:8300 || (echo "watchdog: restarting botmaximus" && systemctl restart botmaximus.service)'
+SyslogIdentifier=botmaximus-watchdog

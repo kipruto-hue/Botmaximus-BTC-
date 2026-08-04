@@ -1,0 +1,10 @@
+# The repo is developed on Windows but ops/systemd/ is deployed to Linux.
+# A unit file checked out with CRLF gets a trailing \r on every value --
+# ExecStart paths silently gain an invisible character and the unit fails to
+# start with a "No such file or directory" naming a path that plainly exists.
+*.service text eol=lf
+*.timer   text eol=lf
+*.sh      text eol=lf
+
+# PowerShell is CRLF-native and only ever runs on Windows here.
+*.ps1     text eol=crlf

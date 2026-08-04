@@ -1,0 +1,38 @@
+[Unit]
+Description=BOTMAXIMUS collector and API
+# Ordering only, not a hard dependency: the collector's own retry loop handles a
+# mongod that is slow to accept connections, and a hard Requires= would take the
+# collector down with mongod on every mongod restart.
+After=network-online.target mongod.service
+Wants=network-online.target mongod.service
+
+[Service]
+Type=simple
+User=botmaximus
+WorkingDirectory=/opt/botmaximus/server
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/botmaximus/env
+ExecStart=/opt/botmaximus/server/.venv/bin/python -m botmaximus.main
+
+Restart=always
+RestartSec=10
+# Crash-loop ceiling. Reconnecting to Binance every few seconds risks a
+# rate-limit ban, which costs far more coverage than the outage being recovered
+# from. Above this rate systemd stops trying and leaves the unit failed, which
+# is the correct loud failure -- the watchdog alerting on it is the point.
+StartLimitIntervalSec=3600
+StartLimitBurst=6
+
+# The process holds no state worth protecting on disk beyond what Mongo owns.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/botmaximus/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botmaximus
+
+[Install]
+WantedBy=multi-user.target

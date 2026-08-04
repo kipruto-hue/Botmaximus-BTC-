@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily BOTMAXIMUS database backup
+
+[Timer]
+# 03:20 UTC — off the 00:00/08:00/16:00 funding settlements, so the dump's read
+# load does not land on the busiest ingest moments of the day.
+OnCalendar=*-*-* 03:20:00 UTC
+# Missed while the box was off? Run it on the next boot rather than skipping a
+# day silently.
+Persistent=true
+RandomizedDelaySec=5min
+Unit=botmaximus-backup.service
+
+[Install]
+WantedBy=timers.target

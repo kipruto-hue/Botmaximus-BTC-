@@ -1,0 +1,14 @@
+[Unit]
+Description=Probe BOTMAXIMUS feed freshness every 2 minutes
+
+[Timer]
+# 3 minutes after boot, then every 2. The delay matters: the collector runs a
+# 7-day backfill scan on startup, and probing before it has stored anything
+# would read as unhealthy and restart it into an endless loop.
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=botmaximus-watchdog.service
+
+[Install]
+WantedBy=timers.target
