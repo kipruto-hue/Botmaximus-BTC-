@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from botmaximus.config import settings
 from botmaximus.db import mongo
 from botmaximus.db.schema import DATASET_COLLECTIONS, QUARANTINE, ensure_schema
+from botmaximus.execution import venue
+from botmaximus.obs import degradation
 from botmaximus.pipeline import coverage
 from botmaximus.pipeline.backfill import OhlcvBackfiller
 from botmaximus.pipeline.bus import Pipeline
@@ -91,6 +93,16 @@ async def lifespan(app: FastAPI):
     await ensure_schema()
     await coverage.ensure_indexes()
     await strategy_store.ensure_indexes()
+    await degradation.ensure_indexes()
+
+    # Constitution §9: Bybit constants come from Bybit. Fetched once, here,
+    # before anything can size an order. `venue.get()` raises if this was
+    # skipped rather than falling back to assumed numbers.
+    if settings.venue == "bybit":
+        vc = await venue.init()
+        log.info("venue constants: min_notional=%s maint_margin=%s taker=%s (%s)",
+                 vc.min_notional, vc.tiers[0].maint_margin,
+                 vc.taker_fee_rate, vc.fee_source)
 
     # risk core loads persisted equity/peak/kill state — a restart never resets it
     risk_core = RiskCore(mongo.get_db())

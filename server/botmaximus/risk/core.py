@@ -11,7 +11,9 @@ import logging
 from datetime import datetime, timezone
 
 from botmaximus.config import settings
-from botmaximus.pipeline.telemetry import BUDGETS_MS, telemetry
+from botmaximus.execution import venue
+from botmaximus.obs import degradation
+from botmaximus.risk import freshness
 from botmaximus.risk.kills import KillStack
 from botmaximus.risk.state import (
     OpenPosition,
@@ -27,13 +29,18 @@ RISK_STATE_COLLECTION = "risk_state"
 RISK_EVENTS_COLLECTION = "risk_events"
 PORTFOLIO_DOC_ID = "portfolio"
 
-BTC_QTY_STEP = 0.001            # Binance BTCUSDT quantity step
-MIN_NOTIONAL_USD = 100.0        # Binance perp minimum order notional
-MAINT_MARGIN_RATE = 0.004       # BTCUSDT lowest tier maintenance margin
 EDGE_COST_MARGIN = 1.5          # expected edge must be ≥ 1.5× expected cost
 
-# feeds that must be fresh before any entry (§4.2); budget-less feeds are skipped
-REQUIRED_FRESH_FEEDS = ("btc_price_tick", "btc_ohlcv_1m")
+# Quantity step, minimum notional and maintenance margin used to be constants
+# copied from Binance. Two of the three were wrong for Bybit — min notional by
+# 20x, and maintenance margin low by 25%, which made the estimated liquidation
+# price sit further from entry than the real one and let the stop-vs-liquidation
+# buffer approve trades closer to the edge than the operator allowed.
+# They now come from the venue itself (constitution §9): `execution/venue.py`.
+#
+# Freshness used to check a fixed pair of feeds for every strategy. It is now
+# resolved from the strategy's declared `required_feeds` (§8) — see
+# `risk/freshness.py` for why the fixed pair was both too strict and too loose.
 
 
 class RiskCore:
@@ -99,12 +106,15 @@ class RiskCore:
         if reasons:
             return Rejection(intent, reasons)
 
+        vc = venue.get()        # raises if startup never fetched them
         risk_usd = self.portfolio.equity * settings.risk_per_trade_pct / 100
-        qty = int(risk_usd / stop_distance / BTC_QTY_STEP) * BTC_QTY_STEP
-        if qty <= 0:
+        qty = vc.round_qty(risk_usd / stop_distance)
+        if qty <= 0 or qty < vc.min_order_qty:
             return Rejection(intent, ["risk_too_small_for_min_qty"])
+        if qty > vc.max_order_qty:
+            return Rejection(intent, ["above_venue_max_qty"])
         notional = qty * intent.entry_price
-        if notional < MIN_NOTIONAL_USD:
+        if notional < vc.min_notional:
             return Rejection(intent, ["below_min_notional"])
 
         return SizedOrder(
@@ -113,17 +123,27 @@ class RiskCore:
             notional_usd=round(notional, 2),
             risk_usd=round(qty * stop_distance, 2),
             implied_leverage=round(notional / self.portfolio.equity, 3),
-            est_liquidation_price=self._liquidation_price(intent.direction, intent.entry_price),
+            est_liquidation_price=self._liquidation_price(
+                intent.direction, intent.entry_price, notional),
         )
 
     @staticmethod
-    def _liquidation_price(direction: str, entry: float) -> float:
-        """Isolated one-way USDⓈ-M approximation at the configured leverage cap.
-        Conservative for paper: assumes the position is margined at the cap."""
+    def _liquidation_price(direction: str, entry: float,
+                           notional_usd: float = 0.0) -> float:
+        """Isolated one-way USDT-margined approximation at the leverage cap.
+        Conservative for paper: assumes the position is margined at the cap.
+
+        The maintenance-margin rate is selected from Bybit's real tier ladder
+        for this position's notional, not a single assumed number. A rate that
+        is too low pushes the estimate away from entry and makes the
+        stop-vs-liquidation buffer approve trades that sit nearer the edge than
+        the operator authorised.
+        """
         lev = settings.leverage_cap
+        mmr = venue.get().maint_margin_for(notional_usd)
         if direction == "LONG":
-            return entry * (1 - 1 / lev + MAINT_MARGIN_RATE)
-        return entry * (1 + 1 / lev - MAINT_MARGIN_RATE)
+            return entry * (1 - 1 / lev + mmr)
+        return entry * (1 + 1 / lev - mmr)
 
     # ---- pre-trade checks (§4.2) — all must pass, deterministic ----
     async def pre_trade_check(self, sized: SizedOrder) -> SizedOrder | Rejection:
@@ -157,7 +177,7 @@ class RiskCore:
             reasons.append("insufficient_free_margin")
 
         reasons += self._check_stop_vs_liquidation(sized)
-        reasons += self._check_feed_freshness()
+        reasons += self._check_feed_freshness(intent.required_feeds)
         reasons += self._check_edge_over_cost(intent)
 
         verdict: SizedOrder | Rejection = Rejection(intent, reasons) if reasons else sized
@@ -183,16 +203,22 @@ class RiskCore:
         return []
 
     @staticmethod
-    def _check_feed_freshness() -> list[str]:
-        out = []
-        for ds in REQUIRED_FRESH_FEEDS:
-            budget = BUDGETS_MS.get(ds)
-            if budget is None:
-                continue
-            fresh = telemetry.freshness_ms(ds)
-            if fresh is None or fresh > budget:
-                out.append(f"feed_stale:{ds}")
-        return out
+    def _check_feed_freshness(required_feeds: tuple[str, ...] | list[str]) -> list[str]:
+        """Stale-feed reasons for exactly the feeds this strategy declared (§8).
+
+        An empty declaration is not treated as "nothing to check" — that would
+        let an under-specified strategy trade with no freshness guard at all.
+        It falls back to the baseline pair and records a degradation, so the
+        gap is countable instead of invisible (§11).
+        """
+        if not required_feeds:
+            degradation.record_sync(
+                "freshness_no_declared_feeds",
+                "strategy declared no required_feeds — falling back to the "
+                "baseline pair; freshness is not being checked for whatever "
+                "this strategy actually reads")
+            required_feeds = freshness.BASELINE_FEEDS
+        return freshness.assert_fresh(required_feeds)
 
     @staticmethod
     def _check_edge_over_cost(intent: OrderIntent) -> list[str]:

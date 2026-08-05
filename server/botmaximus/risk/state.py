@@ -21,6 +21,11 @@ class OrderIntent:
     expected_edge_pct: float | None = None   # gross expected move, for edge-over-cost
     expected_cost_pct: float | None = None   # round-trip cost estimate (cost model, Pass B)
     thesis: str = ""
+    #: The strategy's declared `required_feeds`, carried so the pre-trade check
+    #: can verify freshness for what THIS strategy reads rather than a fixed
+    #: pair (§8). Empty means undeclared: the risk core falls back to the
+    #: baseline pair and records a degradation rather than skipping the check.
+    required_feeds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

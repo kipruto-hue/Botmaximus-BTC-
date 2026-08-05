@@ -1,0 +1,79 @@
+# BOTMAXIMUS operational configuration.
+#
+# This file is COMMITTED. It therefore contains no credentials of any kind.
+#
+# The spec asked for api_key/api_secret here and also said "never in code" --
+# those cannot both hold, because a committed YAML is code. Secrets live in
+# server/.env (gitignored, loaded as SecretStr so they render as '**********'
+# in logs and tracebacks). This file holds only what is safe to publish, and
+# the two `*_env` keys below name the environment variables to read.
+#
+# Anything set here overrides the defaults in server/botmaximus/config.py.
+
+venue:
+  name: bybit
+  # LINEAR = USDT-margined perpetual, PnL linear in price, equity in USDT.
+  # The contract literally named "BTC/USD" on Bybit is INVERSE: coin-margined,
+  # non-linear PnL, BTC-denominated equity. The risk core's sizing and
+  # liquidation estimate assume linear. Do not change this without that maths.
+  category: linear
+  testnet: true                 # demo trading; flip only with intent
+  api_key_env: BYBIT_API_KEY    # NAME of the env var, never the value
+  api_secret_env: BYBIT_API_SECRET
+
+instrument:
+  # Single instrument by design. There is no multi-coin logic in this repo to
+  # remove; asserting one symbol at startup is safer than repeating a literal
+  # in every file, because a literal that drifts is invisible.
+  symbol: BTCUSDT
+  interval: "1m"                # Bybit's MINIMUM kline is 1 minute.
+                                # There is no 5s kline: interval=5 means 5
+                                # MINUTES, and interval="5s" is silently
+                                # accepted and treated as 5 minutes.
+
+risk:
+  # leverage_cap is operator-locked at 3 in config.py and the liquidation
+  # buffer is derived from it. The spec asked for 5; raising it widens
+  # liquidation risk per unit of stop distance, so it is left at the locked
+  # value and flagged rather than changed silently.
+  leverage: 3
+  leverage_requested_by_spec: 5   # unapplied; needs an explicit decision
+  risk_per_trade_pct: 0.25
+  max_open_risk_pct: 1.0
+  max_concurrent_positions: 1
+  daily_drawdown_stop_pct: 3.0    # enforced by the risk core, not by main.py
+  daily_stop_cooldown_hours: 24
+  max_spread_pct: 0.05            # skip entries when the book is this wide
+
+session:
+  # 15:00-17:00 Africa/Nairobi. Two things to know:
+  #  - The spec's success criteria said 3:30PM-5:30PM, which is 15:30-17:30.
+  #    These hours follow the explicit start_hour/end_hour given (15/17).
+  #  - This window is NOT the London Killzone. 15:00-17:00 Nairobi is
+  #    12:00-14:00 UTC = 08:00-10:00 New York -- the NEW YORK killzone.
+  #    London Killzone (07:00-10:00 London) is 09:00-12:00 Nairobi.
+  enabled: true
+  timezone: Africa/Nairobi
+  start: "15:00"
+  end: "17:00"
+  label: new_york_killzone       # named for what the hours actually are
+  # Entries are blocked outside the window. Exits are NEVER blocked: refusing
+  # to close an open position because the clock rolled past 17:00 would turn a
+  # session filter into an unbounded hold.
+  block_entries_only: true
+
+data:
+  raw_dir: data/raw
+  parquet: data/btcusdt_1m.parquet   # 1m, not 5s -- see instrument.interval
+  live_csv: data/live_btcusdt.csv
+  mongo_db: botmaximus_bybit
+
+logging:
+  dir: logs
+  bot_log: logs/bot.log
+  trades_csv: logs/trades.csv
+
+alerts:
+  telegram_enabled: false
+  telegram_token_env: TELEGRAM_BOT_TOKEN
+  telegram_chat_id_env: TELEGRAM_CHAT_ID
