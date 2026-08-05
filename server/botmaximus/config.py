@@ -3,6 +3,7 @@
 Every value can be overridden via environment variables or a `.env` file
 in the server root (e.g. `MONGO_URI=...`).
 """
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -121,10 +122,60 @@ class Settings(BaseSettings):
     generation_cadence_s: int | None = None      # throttled to backtest throughput
     decay_repair_trigger: str | None = None      # §7.1 sequential-test trigger
 
+    # ---- secrets ----
+    # Every one is SecretStr: repr/str render as '**********', so a stray log
+    # line, an exception traceback or a settings dump cannot leak a live key.
+    # Read the real value with `.get_secret_value()` at the point of use, never
+    # earlier — a plain str assigned to a local is exactly how keys reach logs.
+    #
+    # Values live in server/.env, which is gitignored. `.env.example` is the
+    # committed template; it must never contain a real key.
+    #
+    # Venue credentials. Trading keys are the only secrets here that can move
+    # money, so they get their own guard: `bybit_testnet` defaults True and
+    # `live_trading_enabled` defaults False, and BOTH must be turned off/on
+    # deliberately. A misconfigured deploy fails toward the harmless state.
+    bybit_api_key: SecretStr | None = None
+    bybit_api_secret: SecretStr | None = None
+    bybit_testnet: bool = True
+    live_trading_enabled: bool = False
+
+    # Generation / scrutiny model keys (§6, §8). Which one is needed depends on
+    # `generation_llm`; `require_secrets()` checks the matching pair.
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
+
     # api
     api_host: str = "127.0.0.1"
     api_port: int = 8300
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    # ---- fail-loudly guards (§2) ----
+    def require(self, *names: str) -> None:
+        """Assert secrets are present at the point of use, not at import.
+
+        Import-time validation would make the whole system unstartable because a
+        key for a subsystem that is not running yet is absent — the collector
+        does not need a trading key, and Pass C2's model key is irrelevant to a
+        backtest. Checking here keeps startup possible while making the failure
+        immediate and specific when a subsystem actually reaches for a secret.
+        """
+        missing = [n for n in names if getattr(self, n, None) is None]
+        if missing:
+            raise RuntimeError(
+                f"missing required secret(s): {', '.join(missing)}. Set them in "
+                f"server/.env (see .env.example). Refusing to continue rather "
+                f"than run with an unconfigured credential.")
+
+    def require_trading(self) -> None:
+        """Called before any order-placing path. Both switches must be set
+        deliberately; neither has a default that reaches a live venue."""
+        self.require("bybit_api_key", "bybit_api_secret")
+        if not self.live_trading_enabled:
+            raise RuntimeError(
+                "live_trading_enabled is False — refusing to place orders. This "
+                "is the default and it is deliberate: reaching a real venue must "
+                "be an explicit decision, never something a config drift enables.")
 
 
 settings = Settings()

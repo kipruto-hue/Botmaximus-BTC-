@@ -215,6 +215,15 @@ async def get_quarantine(limit: int = 20):
     return [_serialize(d) async for d in cursor]
 
 
+@app.get("/api/execution/calibration")
+async def get_calibration(strategy_id: str | None = None):
+    """Is the cost model telling the truth? Reports `status:
+    no_realized_fills` until paper execution writes fills — deliberately, so an
+    empty aggregate (every drift 0.0) is never mistaken for a calibrated one."""
+    from botmaximus.execution import ledger
+    return await ledger.calibration(strategy_id)
+
+
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     await ws.accept()

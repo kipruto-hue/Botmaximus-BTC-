@@ -41,6 +41,36 @@ class CostModel:
     def fee(self, notional: float) -> float:
         return abs(notional) * self.taker_fee_rate
 
+    def predict_leg(self, trade_id: str, strategy_id: str, leg: str,
+                    direction: str, qty: float, reference_price: float,
+                    decision_time: datetime, symbol: str = "BTCUSDT",
+                    predicted_funding: float = 0.0):
+        """Structured prediction for the execution ledger.
+
+        Composed from the same `fill_price`/`fee` primitives the backtester
+        replays with, so the ledger cannot end up measuring drift against a
+        second, subtly different cost model — which would make every reading
+        meaningless in a way that looks exactly like a real result.
+        """
+        from botmaximus.execution.ledger import Prediction
+
+        fill = self.fill_price(reference_price, direction, leg)
+        return Prediction(
+            trade_id=trade_id,
+            strategy_id=strategy_id,
+            leg=leg,
+            direction=direction,
+            symbol=symbol,
+            qty=qty,
+            decision_time=decision_time,
+            reference_price=reference_price,
+            predicted_fill=fill,
+            predicted_fee=self.fee(qty * fill),
+            predicted_slippage_bps=self.slippage_bps,
+            predicted_latency_ms=settings.latency_bars * 60_000,
+            predicted_funding=predicted_funding,
+        )
+
     # ---- funding ----
     def funding_cost(self, direction: str, qty: float, avg_price: float,
                      entry_time: datetime, exit_time: datetime) -> float:

@@ -26,6 +26,25 @@ T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 # =====================================================================
 # Fake Mongo — enough of the update_one/$inc/$setOnInsert contract
 # =====================================================================
+class FakeCursor:
+    """Enough of the PyMongo cursor contract for find().sort().limit()."""
+    def __init__(self, docs: list[dict]):
+        self.docs = docs
+
+    def sort(self, field, direction=1):
+        self.docs = sorted(self.docs, key=lambda d: d.get(field) or 0,
+                           reverse=direction < 0)
+        return self
+
+    def limit(self, n):
+        self.docs = self.docs[:n]
+        return self
+
+    async def __aiter__(self):
+        for d in self.docs:
+            yield d
+
+
 class FakeCollection:
     def __init__(self):
         self.docs: list[dict] = []
@@ -33,6 +52,10 @@ class FakeCollection:
     @staticmethod
     def _match(doc: dict, query: dict) -> bool:
         return all(doc.get(k) == v for k, v in query.items())
+
+    def find(self, query=None, projection=None):
+        return FakeCursor([dict(d) for d in self.docs
+                           if self._match(d, query or {})])
 
     async def find_one(self, query, projection=None):
         return next((d for d in self.docs if self._match(d, query)), None)
