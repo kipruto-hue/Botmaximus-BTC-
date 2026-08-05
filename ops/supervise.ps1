@@ -34,6 +34,12 @@ param(
     # On the VPS this is handled by botmaximus-backup.timer instead and these
     # parameters go unused -- see ops/systemd/.
     [string] $BackupDest        = "D:\botmaximus-backups",
+    # MUST match config.db_name. The venue migration moved live data to
+    # botmaximus_bybit while this defaulted to the old botmaximus, so the daily
+    # backup silently protected the retired Binance dataset and left the live
+    # one uncovered -- a backup that runs, verifies and reports success while
+    # covering the wrong database is worse than none, because it is trusted.
+    [string] $DbName            = "botmaximus_bybit",
     [int]    $BackupHourUtc     = 3,
     [int]    $BackupKeep        = 7,
     [switch] $NoBackup,
@@ -104,19 +110,27 @@ function Invoke-DailyBackup {
     $today = $now.ToString("yyyy-MM-dd")
     if ((Test-Path $stampFile) -and ((Get-Content $stampFile -Raw).Trim() -eq $today)) { return }
 
-    Write-Log INFO "running daily backup -> $BackupDest"
+    Write-Log INFO "running daily backup of $DbName -> $BackupDest"
     # The dump verifies itself and only prunes after verifying, so a failed
     # backup can never delete the last good one. Failure is logged and retried
     # tomorrow rather than being fatal -- a backup problem must not take the
     # collector down with it, because uptime protects data that no backup can
     # recover (liquidations and order book have no history endpoint).
-    & $python (Join-Path $PSScriptRoot "mongo_backup.py") dump --dest $BackupDest --keep $BackupKeep 2>&1 |
+    # Local Continue: in PowerShell 5.1 a native command's stderr, redirected
+    # with 2>&1, becomes an ErrorRecord, and under the script's
+    # ErrorActionPreference=Stop that is TERMINATING. A stray Python warning on
+    # stderr would take the whole supervisor down mid-backup -- silently, since
+    # the process simply ends. The backup's own exit code is the real verdict.
+    $ErrorActionPreference = "Continue"
+    & $python (Join-Path $PSScriptRoot "mongo_backup.py") dump --db $DbName --dest $BackupDest --keep $BackupKeep 2>&1 |
         ForEach-Object { Write-Log INFO "  backup| $_" }
-    if ($LASTEXITCODE -eq 0) {
+    $backupExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($backupExit -eq 0) {
         Set-Content -Path $stampFile -Value $today -Encoding utf8
         Write-Log INFO "backup complete"
     } else {
-        Write-Log ERROR "backup FAILED (exit $LASTEXITCODE) - will retry tomorrow"
+        Write-Log ERROR "backup FAILED (exit $backupExit) - will retry tomorrow"
     }
 }
 
@@ -133,8 +147,19 @@ $script:lastStart     = [datetime]::MinValue
 $script:lastHeartbeat = [datetime]::MinValue    # so the first healthy probe logs
 $halted               = $false
 
-Write-Log INFO "supervisor starting (interval ${IntervalSec}s, ${StaleStrikes} strikes, max ${MaxRestartsPerHr}/hr)"
+Write-Log INFO "supervisor starting (interval ${IntervalSec}s, ${StaleStrikes} strikes, max ${MaxRestartsPerHr}/hr, db $DbName)"
 
+# A supervisor must announce its own death. It died silently once during this
+# build -- logged its start line, then nothing, while the collector it was
+# meant to protect stayed down and the data it was meant to protect stopped
+# arriving. Anything that ends this process now says so on the way out.
+trap {
+    Write-Log ERROR "FATAL (trap): $_"
+    Write-Log ERROR "  at: $($_.InvocationInfo.PositionMessage -replace "`r?`n", ' ')"
+    continue
+}
+
+try {
 while ($true) {
     try {
         Start-Mongo
@@ -190,4 +215,13 @@ while ($true) {
 
     if ($Once) { break }
     Start-Sleep -Seconds $IntervalSec
+}
+}
+finally {
+    # Reached on a clean -Once exit, and on ANY unhandled termination. The loop
+    # is infinite, so outside -Once this line appearing in the log means the
+    # supervisor stopped supervising and nothing is watching the collector.
+    if (-not $Once) {
+        Write-Log ERROR "supervisor LOOP EXITED - nothing is watching the collector"
+    }
 }
