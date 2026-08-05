@@ -1,5 +1,26 @@
 # BOTMAXIMUS (BTC) — Live Dashboard: What Is Real, What Is Not
 
+> **Update 2026-08-05 — Finish-the-System build.** The arbiter, scrutiny gate,
+> generator, decay monitor and paper engine now exist, and their data is served
+> by real endpoints:
+>
+> | Panel | Endpoint | State |
+> |---|---|---|
+> | Arbiter Decisions | `GET /api/arbiter/events` | **real backend, panel not built** |
+> | Scrutiny Feed | `GET /api/scrutiny/events` | **real backend**, replaces the `Math.random()` feed once the panel is rewired; carries `provider=rules` |
+> | Cost Drift | `GET /api/execution/calibration` | **real backend**; reports `no_realized_fills` until paper trades exist |
+> | Venue constants | `GET /api/venue` | **real** — shows whether fees are the account's or assumed |
+> | Degradation | `GET /api/degradation` | **real** — non-empty means the system is not at full strength |
+> | MASTER KILL | `POST /api/risk/master_kill` | **real and it flattens** — the first non-simulated kill in this project |
+>
+> **The React panels themselves have NOT been rewired yet, so their `SIM`
+> badges stay.** A badge is removed in the same commit that points the panel at
+> its endpoint — not when the endpoint merely becomes available. Until then the
+> screen is still animation and this table is the honest map.
+>
+> Still true: **nothing has traded.** `live_trading_enabled` is `False`,
+> `bybit_testnet` is `True`, and no Bybit credentials are configured.
+
 **Snapshot:** 2026-07-24 · engine uptime ~6h40m · BTC/USD ~$63,965 · 0 quarantined
 **Repo:** main @ b717f2c · **Ports:** Mongo 27017 · engine 8300 · dashboard 5173
 

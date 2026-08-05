@@ -152,6 +152,28 @@ class Settings(BaseSettings):
     generation_cadence_s: int | None = None      # throttled to backtest throughput
     decay_repair_trigger: str | None = None      # §7.1 sequential-test trigger
 
+    # ---- finish-the-system build (§2 of the Finish-the-System prompt) ----
+    #: Repair attempts per lineage before the parent retires for good. Caps
+    #: chained Goodharting: each repair is another look at the same gate.
+    lineage_repair_cap: int = 3
+    #: `rules` ships in this build. `llm` exists as an interface only and is
+    #: unreachable — flipping it is a v2 operator decision, not a config tweak.
+    scrutiny_provider: str = "rules"
+    scrutiny_latency_budget_ms: int = 800
+    #: Post-entry quiet period, so a flapping signal cannot churn the book.
+    arbiter_cooldown_s: int = 300
+    #: "Africa/Nairobi:15:30-17:30". Unset means no window is enforced, which
+    #: the executor treats as a configuration error rather than "always open".
+    trade_window_local: str | None = None
+    #: `taker` | `maker_first_then_taker`. The second implements the audit's
+    #: maker-entry test: at 5.5bps taker each side, fee is the dominant term.
+    order_entry_style: str = "taker"
+    maker_timeout_ms: int = 10_000
+    #: Realized/predicted cost ratio that demotes a strategy, over a rolling
+    #: window of reconciled legs.
+    auto_demote_cost_multiple: float = 1.5
+    auto_demote_leg_window: int = 10
+
     # ---- secrets ----
     # Every one is SecretStr: repr/str render as '**********', so a stray log
     # line, an exception traceback or a settings dump cannot leak a live key.

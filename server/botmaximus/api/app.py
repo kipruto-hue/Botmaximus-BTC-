@@ -15,8 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from botmaximus.config import settings
 from botmaximus.db import mongo
 from botmaximus.db.schema import DATASET_COLLECTIONS, QUARANTINE, ensure_schema
+from botmaximus.arbiter import core as arbiter_core
 from botmaximus.execution import venue
+from botmaximus.execution import ledger as execution_ledger
 from botmaximus.obs import degradation
+from botmaximus.scrutiny import gate as scrutiny_gate
+from botmaximus.strategy import decay, trials
 from botmaximus.pipeline import coverage
 from botmaximus.pipeline.backfill import OhlcvBackfiller
 from botmaximus.pipeline.bus import Pipeline
@@ -94,6 +98,11 @@ async def lifespan(app: FastAPI):
     await coverage.ensure_indexes()
     await strategy_store.ensure_indexes()
     await degradation.ensure_indexes()
+    await arbiter_core.ensure_indexes()
+    await scrutiny_gate.ensure_indexes()
+    await execution_ledger.ensure_indexes()
+    await decay.ensure_indexes()
+    await trials.ensure_indexes()
 
     # Constitution §9: Bybit constants come from Bybit. Fetched once, here,
     # before anything can size an order. `venue.get()` raises if this was
@@ -264,6 +273,33 @@ async def get_quarantine(limit: int = 20):
     return [_serialize(d) async for d in cursor]
 
 
+MASTER_KILL_TOKEN = "CONFIRM-MASTER-KILL"
+
+
+@app.post("/api/risk/master_kill")
+async def master_kill(token: str = "", reason: str = "operator"):
+    """Operator master kill: block, cancel every order, close every position.
+
+    Token-guarded in the same style as the L3 reset. This is the first
+    non-simulated kill button in the project — before it, the dashboard's kill
+    was local-only, which is the most dangerous kind of safety control: one
+    that looks armed and does nothing.
+    """
+    if token != MASTER_KILL_TOKEN:
+        return {"error": "invalid token", "hint": "POST ?token=CONFIRM-MASTER-KILL"}
+    if risk_core is None:
+        return {"error": "risk core not initialised"}
+    result = await risk_core.kills.master_kill(f"operator:{reason}")
+    return {
+        "killed": True,
+        "flatten": result,
+        "warning": None if result else
+        "no execution layer attached — entries are blocked but any open "
+        "position is still on",
+        "risk": risk_core.snapshot(),
+    }
+
+
 @app.get("/api/execution/calibration")
 async def get_calibration(strategy_id: str | None = None):
     """Is the cost model telling the truth? Reports `status:
@@ -271,6 +307,61 @@ async def get_calibration(strategy_id: str | None = None):
     empty aggregate (every drift 0.0) is never mistaken for a calibrated one."""
     from botmaximus.execution import ledger
     return await ledger.calibration(strategy_id)
+
+
+@app.get("/api/arbiter/events")
+async def get_arbiter_events(limit: int = 50):
+    """Real decisions, including the refusals. `reason` explains every
+    no-trade: conflict, cooldown, outside_window, position_open, all_stale."""
+    db = mongo.get_db()
+    cursor = db[arbiter_core.ARBITER_EVENTS].find({}, {"_id": 0}) \
+        .sort("at", -1).limit(min(limit, 200))
+    return [_serialize(d) async for d in cursor]
+
+
+@app.get("/api/scrutiny/events")
+async def get_scrutiny_events(limit: int = 50):
+    db = mongo.get_db()
+    cursor = db[scrutiny_gate.SCRUTINY_EVENTS].find({}, {"_id": 0}) \
+        .sort("at", -1).limit(min(limit, 200))
+    rows = [_serialize(d) async for d in cursor]
+    return {"provider": settings.scrutiny_provider, "events": rows}
+
+
+@app.get("/api/degradation")
+async def get_degradation(limit: int = 50):
+    """Constitution §11 made visible: what has fallen back, and how often.
+    A non-empty counter here is the system telling you it is not at full
+    strength — silence is the only healthy reading."""
+    db = mongo.get_db()
+    cursor = db[degradation.DEGRADED_EVENTS].find({}, {"_id": 0}) \
+        .sort("at", -1).limit(min(limit, 200))
+    return {"counts": degradation.counts(),
+            "total": degradation.total(),
+            "recent": [_serialize(d) async for d in cursor]}
+
+
+@app.get("/api/venue")
+async def get_venue():
+    """The constants orders are actually sized against, and where they came
+    from. `fee_source: config` means the account's real fee schedule was not
+    readable and an assumed rate is in use."""
+    try:
+        vc = venue.get()
+    except RuntimeError as e:
+        return {"error": str(e)}
+    return {
+        "host": vc.host, "symbol": vc.symbol, "category": vc.category,
+        "qty_step": vc.qty_step, "min_order_qty": vc.min_order_qty,
+        "min_notional": vc.min_notional, "tick_size": vc.tick_size,
+        "maint_margin_lowest_tier": vc.tiers[0].maint_margin,
+        "tiers": len(vc.tiers),
+        "taker_fee_rate": vc.taker_fee_rate,
+        "maker_fee_rate": vc.maker_fee_rate,
+        "fee_source": vc.fee_source,
+        "testnet": settings.bybit_testnet,
+        "live_trading_enabled": settings.live_trading_enabled,
+    }
 
 
 @app.websocket("/ws/live")
