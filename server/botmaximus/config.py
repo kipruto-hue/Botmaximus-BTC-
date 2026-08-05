@@ -198,14 +198,27 @@ class Settings(BaseSettings):
                 f"than run with an unconfigured credential.")
 
     def require_trading(self) -> None:
-        """Called before any order-placing path. Both switches must be set
-        deliberately; neither has a default that reaches a live venue."""
+        """Called before any order-placing path.
+
+        `live_trading_enabled` gates **risking real money**, not trading at all.
+        On testnet there is no real money, so demo orders are permitted while it
+        stays False — which is what lets paper trading be proven before anyone
+        argues about flipping it. Reaching a *live* account still requires the
+        flag to be set deliberately, so the default configuration remains
+        incapable of losing anything.
+
+        Credentials are required either way: an unconfigured key is a
+        misconfiguration on demo exactly as much as on live.
+        """
         self.require("bybit_api_key", "bybit_api_secret")
+        if self.bybit_testnet:
+            return
         if not self.live_trading_enabled:
             raise RuntimeError(
-                "live_trading_enabled is False — refusing to place orders. This "
-                "is the default and it is deliberate: reaching a real venue must "
-                "be an explicit decision, never something a config drift enables.")
+                "bybit_testnet is False and live_trading_enabled is False — "
+                "refusing to place orders against a real account. Reaching a "
+                "live venue must be an explicit decision, never something a "
+                "config drift enables.")
 
 
 settings = Settings()

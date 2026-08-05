@@ -55,17 +55,35 @@ def test_trading_is_refused_without_credentials():
         Settings(live_trading_enabled=True).require_trading()
 
 
-def test_trading_is_refused_while_the_live_switch_is_off():
-    """Credentials alone are not consent. Both switches are deliberate."""
+def test_a_real_account_is_refused_while_the_live_switch_is_off():
+    """Credentials alone are not consent to risk real money.
+
+    `live_trading_enabled` gates reaching a LIVE account, not trading at all --
+    otherwise demo trading could never be proven, and the flag would have to be
+    flipped just to test the system, which is the opposite of what it is for.
+    """
     s = Settings(bybit_api_key="k", bybit_api_secret="s",
-                 live_trading_enabled=False)
-    with pytest.raises(RuntimeError, match="live_trading_enabled"):
+                 bybit_testnet=False, live_trading_enabled=False)
+    with pytest.raises(RuntimeError, match="live venue"):
         s.require_trading()
 
 
-def test_trading_is_allowed_only_when_both_switches_are_set():
+def test_testnet_trading_is_allowed_without_the_live_switch():
+    """There is no real money on demo, so the guard must not block it."""
     Settings(bybit_api_key="k", bybit_api_secret="s",
-             live_trading_enabled=True).require_trading()
+             bybit_testnet=True, live_trading_enabled=False).require_trading()
+
+
+def test_live_trading_is_allowed_only_when_both_switches_are_set():
+    Settings(bybit_api_key="k", bybit_api_secret="s",
+             bybit_testnet=False, live_trading_enabled=True).require_trading()
+
+
+def test_credentials_are_required_even_on_testnet():
+    """An unconfigured key is a misconfiguration on demo exactly as much as on
+    live; silently proceeding would just move the failure later."""
+    with pytest.raises(RuntimeError, match="missing required secret"):
+        Settings(bybit_testnet=True).require_trading()
 
 
 # =====================================================================
