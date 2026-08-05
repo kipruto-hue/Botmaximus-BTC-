@@ -41,6 +41,50 @@ log = logging.getLogger(__name__)
 risk_core: RiskCore | None = None
 
 
+def _venue_parser():
+    """One parser per venue, both emitting the identical canonical envelope.
+    Nothing downstream of here may know which venue produced a bar."""
+    if settings.venue == "bybit":
+        from botmaximus.pipeline.parsers.bybit import BybitParser
+        return BybitParser()
+    if settings.venue == "binance":
+        return BinanceParser()
+    raise RuntimeError(
+        f"unknown venue {settings.venue!r} — expected 'bybit' or 'binance'. "
+        f"Refusing to start rather than defaulting to a venue you did not pick.")
+
+
+def _venue_sources(gather_q) -> list:
+    """Collectors for the configured venue.
+
+    Bybit needs one public socket for every topic; Binance needs three (its
+    2026-04-23 migration split futures streams across routed paths). Both
+    supply the same six datasets.
+    """
+    if settings.venue == "bybit":
+        from botmaximus.pipeline.collectors.bybit import BybitPublicCollector
+        from botmaximus.pipeline.collectors.bybit_history import (
+            BybitFundingHistoryCollector,
+            BybitOhlcvBackfiller,
+            BybitOIHistoryCollector,
+        )
+        return [
+            BybitPublicCollector(gather_q),
+            BybitOhlcvBackfiller(gather_q),
+            BybitFundingHistoryCollector(gather_q),
+            BybitOIHistoryCollector(gather_q),
+        ]
+    return [
+        BinanceCollector(gather_q),
+        BinanceFuturesMarketCollector(gather_q),
+        BinanceFuturesDepthCollector(gather_q),
+        BinanceOICollector(gather_q),
+        OhlcvBackfiller(gather_q),
+        FundingHistoryCollector(gather_q),
+        OIHistoryCollector(gather_q),
+    ]
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     global risk_core
@@ -54,18 +98,11 @@ async def lifespan(app: FastAPI):
 
     writer = Writer()
     await writer.seed_dedupe()
-    pipeline = Pipeline(parser=BinanceParser(), gate=QualityGate(), writer=writer)
+    pipeline = Pipeline(parser=_venue_parser(), gate=QualityGate(), writer=writer)
     pipeline.start()
-    sources = [
-        BinanceCollector(pipeline.gather_q),
-        BinanceFuturesMarketCollector(pipeline.gather_q),
-        BinanceFuturesDepthCollector(pipeline.gather_q),
-        BinanceOICollector(pipeline.gather_q),
-        OhlcvBackfiller(pipeline.gather_q),
-        FundingHistoryCollector(pipeline.gather_q),
-        OIHistoryCollector(pipeline.gather_q),
-        CoverageHeartbeat(),
-    ]
+    sources = _venue_sources(pipeline.gather_q) + [CoverageHeartbeat()]
+    log.info("venue: %s (%s %s)", settings.venue, settings.symbol,
+             settings.bybit_category if settings.venue == "bybit" else "futures")
     source_tasks = [
         asyncio.create_task(s.run(), name=f"{s.name}_collector") for s in sources
     ]

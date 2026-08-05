@@ -12,10 +12,35 @@ class Settings(BaseSettings):
 
     # storage
     mongo_uri: str = "mongodb://localhost:27017"
-    db_name: str = "botmaximus"
+    # Per-venue database. Binance and Bybit disagree about price, funding,
+    # liquidity and even what a bar contains, and nothing downstream filters on
+    # `source` — the coverage ledger, the backtester and the feature layer would
+    # blend two venues into one series without a word. Separating at the
+    # database keeps that impossible instead of merely discouraged, and leaves
+    # the Binance era intact in `botmaximus` for comparison.
+    db_name: str = "botmaximus_bybit"
 
-    # instrument & source
-    symbol: str = "BTCUSDT"
+    # ---- instrument & venue ----
+    # The venue the collectors read AND the venue orders would reach. These must
+    # be the same: validating a strategy on one venue's prices, fees, funding
+    # and liquidity while executing on another makes the cost model — already
+    # the dominant term at 5-minute holds — measure the wrong market, and the
+    # execution ledger could not tell that apart from genuine decay.
+    venue: str = "bybit"                    # "bybit" | "binance"
+    symbol: str = "BTCUSDT"                 # linear USDT-margined perpetual
+
+    # Bybit V5. `linear` = USDT-margined, PnL linear in price, equity in USDT —
+    # which is what the risk core's sizing and liquidation estimate assume.
+    # `inverse` (the contract literally named BTC/USD) is coin-margined with
+    # non-linear PnL and would need different maths throughout; it is not
+    # supported and must not be set here without that work.
+    bybit_category: str = "linear"
+    bybit_ws_url: str = "wss://stream.bybit.com/v5/public/linear"
+    bybit_rest_url: str = "https://api.bybit.com"
+    bybit_testnet_rest_url: str = "https://api-testnet.bybit.com"
+    bybit_orderbook_depth: int = 50         # topic depth subscribed
+    bybit_orderbook_store_levels: int = 20  # levels persisted, as on Binance
+
     binance_ws_url: str = "wss://stream.binance.com:9443/stream"
     binance_futures_ws_url: str = "wss://fstream.binance.com"  # routed: /market, /public
     binance_rest_url: str = "https://api.binance.com"
@@ -76,7 +101,12 @@ class Settings(BaseSettings):
     paper_fill_model: str | None = None         # set at execution pass
 
     # ---- backtest cost model (§5.3) — never frictionless ----
-    taker_fee_rate: float = 0.0005              # Binance USDⓈ-M taker, each side
+    # Bybit linear-perp taker, each side. 5.5bps, up from Binance's 5.0 — a 10%
+    # increase in the term that already dominates net P&L at these hold times.
+    # This is the standard non-VIP rate; the account's real rate comes from
+    # /v5/account/fee-rate and needs a key, so verify it before paper trading
+    # and correct this rather than letting the gate judge on a stale number.
+    taker_fee_rate: float = 0.00055
     slippage_bps: float = 1.0                   # conservative constant floor, never zero
     latency_bars: int = 1                       # decision→fill delay, in 1m bars
 

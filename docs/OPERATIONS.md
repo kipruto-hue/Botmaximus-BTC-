@@ -19,13 +19,21 @@ when it dies. The reason is a failure this project has already hit: the
 That matters more here than in most systems, because some of this data cannot
 be re-fetched at any price:
 
-| Feed | Recoverable after an outage? |
-|---|---|
-| `btc_ohlcv_1m` | Yes — REST klines, paginated |
-| `btc_funding_8h` | Yes — settled series endpoint |
-| `btc_oi_5m` | **Only within 30 days** — venue hard limit |
-| `btc_liquidations` | **Never** — no history endpoint exists |
-| `btc_orderbook` | **Never** — no history endpoint exists |
+Recoverability on **Bybit** (the venue since 2026-08-05; the Binance column is
+kept because it explains why parts of the system were shaped the way they are):
+
+| Feed | Bybit | Binance (retired) |
+|---|---|---|
+| `btc_ohlcv_1m` | Yes — klines back to 2021 | Yes |
+| `btc_funding_8h` | Yes — 3+ years | Yes |
+| `btc_oi_5m` | **Yes — 2+ years** | **Only 30 days** (hard limit) |
+| `btc_liquidations` | **Never** — no history endpoint | **Never** |
+| `btc_orderbook` | **Never** — no history endpoint | **Never** |
+
+The open-interest row is the one that changed, and it matters: on Binance, OI
+history (30 days) was shorter than the sealed holdout (90 days), so OI-based
+strategies could not be evaluated **at all** — the search window landed entirely
+before any OI existed. On Bybit that constraint is gone.
 
 An hour of downtime is an hour of liquidation and order-book history that is
 gone permanently, and a hole the coverage gate will correctly refuse to backtest

@@ -11,6 +11,14 @@ Where the cracks form, ordered by *when* they bite. Written 2026-08-02 at
 > **MITIGATED, NOT CLOSED** — supervision now restarts on silence rather than
 > only on death, but it still starts at logon on a desktop that sleeps. See
 > `OPERATIONS.md`; the VPS path is written and not yet provisioned.
+>
+> **Status 2026-08-05:** §2.3 (no predicted-vs-realized ledger) is **CLOSED** —
+> `execution/ledger.py`, reporting `no_realized_fills` until Pass F writes to it.
+> The venue moved to **Bybit BTCUSDT linear perp**, which changes §3.3
+> materially: it is still single-venue, but open-interest history went from 30
+> days to 2+ years, dissolving the holdout/OI conflict recorded in the addendum.
+> Taker fee rose 5.0 → 5.5bps, a 10% increase in the dominant cost term, so
+> every pre-migration backtest verdict is superseded.
 
 This is not a list of bugs. Bugs are found by tests; these are properties of the
 design that are currently correct and will *become* wrong as the system grows

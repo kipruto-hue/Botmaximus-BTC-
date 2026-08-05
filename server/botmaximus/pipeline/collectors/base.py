@@ -26,12 +26,28 @@ class BaseWSCollector(abc.ABC):
     async def handle(self, message: str) -> None:
         """Parse routing info from one ws message and enqueue RawItem(s)."""
 
+    async def on_connect(self, ws) -> None:
+        """Sent immediately after the socket opens. Binance encodes its streams
+        in the URL and needs nothing; Bybit subscribes with a frame."""
+
+    def _reset_state(self) -> None:
+        """Drop anything accumulated from the previous connection.
+
+        Called before every connect, including the first. A collector that
+        maintains incremental state — an order book built from deltas, a merged
+        ticker snapshot — must not carry it across a gap: the levels on the far
+        side are stale, and serving them as live is precisely the failure a
+        reconnect exists to end.
+        """
+
     async def run(self) -> None:
         backoff = 1.0
         while True:
             try:
+                self._reset_state()
                 async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
                     log.info("[%s] connected to %s", self.name, self.url)
+                    await self.on_connect(ws)
                     telemetry.set_ws(self.name, True)
                     backoff = 1.0
                     async for message in ws:
