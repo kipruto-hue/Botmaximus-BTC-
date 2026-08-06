@@ -126,19 +126,44 @@ class LLMProposer(Proposer):
 
     The constructor demands credentials this build does not use, so the live
     path is unreachable by accident rather than by convention.
+
+    Decoding parameters come from `llm/params.generator_profile()` — high
+    temperature inside the DSL's hard grammar, which is the combination that
+    gives novelty without incoherence. They are orchestrator-owned: nothing in
+    a model response may change them.
     """
 
     name = "llm"
 
-    def __init__(self) -> None:
+    def __init__(self, seed: int | None = None) -> None:
+        from botmaximus.llm import params, prompts
+
         settings.require("openai_api_key", "generation_llm")
         self.model = settings.generation_llm
+        self.profile = params.generator_profile(seed)
+        self.system_prompt = prompts.generator()
 
     async def propose(self, brief: dict, n: int) -> list[dict]:
-        raise NotImplementedError(
-            "LLM generation is not called in this build. The interface, "
-            "provenance capture and trial accounting are in place so that "
-            "enabling it later swaps one implementation.")
+        from botmaximus.llm import client
+
+        # Raises LLMUnavailable: the record is assembled in full so provenance
+        # and parameter plumbing are exercised, and only the network step is
+        # missing — on purpose.
+        raise_record = client.LLMCallRecord(
+            role="generator", model_id=self.model,
+            prompt_version=self.system_prompt.version,
+            system_prompt_hash=self.system_prompt.sha,
+            context_hash="", profile_fingerprint=self.profile.fingerprint(),
+            temperature=self.profile.temperature, top_p=self.profile.top_p,
+            max_output_tokens=self.profile.max_output_tokens,
+            stop_sequences=list(self.profile.stop_sequences),
+            seed=self.profile.seed, n=self.profile.n)
+        raise client.LLMUnavailable(
+            f"LLM generation is not called in this build "
+            f"(profile {raise_record.profile_fingerprint}, prompt "
+            f"{raise_record.prompt_version}). The interface, parameter profile, "
+            f"provenance capture and trial accounting are all in place so that "
+            f"enabling it later swaps one implementation.")
 
 
 class Generator:

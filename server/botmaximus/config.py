@@ -174,6 +174,32 @@ class Settings(BaseSettings):
     auto_demote_cost_multiple: float = 1.5
     auto_demote_leg_window: int = 10
 
+    # ---- LLM decoding profiles (LLM Parameters Master Prompt §2.A, §3.A) ----
+    # TWO profiles, deliberately not interchangeable. They serve opposite jobs:
+    # the generator wants exploration inside a safe grammar, the scrutiny gate
+    # wants the same answer to the same setup. A shared constant here would be
+    # a silent merge of those goals, so there is no shared constant and a test
+    # asserts none appears.
+    #
+    # Every one is orchestrator-owned. Nothing in a model response may change
+    # them (§5); a response that suggests otherwise is ignored and logged.
+    gen_temperature: float = 0.9        # 0.7-1.1; below loses novelty, above loses JSON
+    gen_top_p: float = 0.95
+    gen_max_output_tokens: int = 2000   # truncation is a SILENT corruption mode
+    gen_stop_sequences: str = "\n\n---END---"
+    gen_seed: int | None = None         # rotated per cycle; reuse kills diversity
+    gen_max_monthly_usd: float | None = None    # soft budget; breach pauses, never auto-adjusts
+    gen_max_content_retries_per_cycle: int = 2
+
+    scr_temperature: float = 0.1        # 0.0-0.3; consistency IS the safety property
+    scr_top_p: float = 1.0
+    scr_max_output_tokens: int = 250    # enough for a verdict, not for prose that hides reasoning
+    scr_stop_sequences: str = "\n---"
+    scr_seed: int = 7                   # fixed per prompt_version, for veto consistency
+
+    #: Alert thresholds for LLM degradation counters (§2.E, §5).
+    llm_feature_hallucination_alert_rate: float = 0.05
+
     # ---- secrets ----
     # Every one is SecretStr: repr/str render as '**********', so a stray log
     # line, an exception traceback or a settings dump cannot leak a live key.

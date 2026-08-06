@@ -57,8 +57,13 @@ class FakeCollection:
         return FakeCursor([dict(d) for d in self.docs
                            if self._match(d, query or {})])
 
-    async def find_one(self, query, projection=None):
-        return next((d for d in self.docs if self._match(d, query)), None)
+    async def find_one(self, query, projection=None, sort=None):
+        rows = [d for d in self.docs if self._match(d, query)]
+        if sort:
+            field, direction = sort[0]
+            rows = sorted(rows, key=lambda d: d.get(field) or 0,
+                          reverse=direction < 0)
+        return rows[0] if rows else None
 
     async def insert_one(self, doc):
         self.docs.append(dict(doc))

@@ -341,6 +341,18 @@ async def get_degradation(limit: int = 50):
             "recent": [_serialize(d) async for d in cursor]}
 
 
+@app.get("/api/scrutiny/calibration")
+async def get_scrutiny_calibration(days: int = 7):
+    """Veto precision, recall and consistency — the three numbers that judge
+    the gate. Conviction is deliberately not among them: it is the model's
+    self-report, and only ground truth feeds back.
+
+    Drift is fixed by changing thresholds, `k`, or the prompt — never by
+    raising temperature, which would attack the consistency being measured."""
+    from botmaximus.scrutiny import calibration
+    return (await calibration.report(mongo.get_db(), days)).to_dict()
+
+
 @app.get("/api/venue")
 async def get_venue():
     """The constants orders are actually sized against, and where they came
