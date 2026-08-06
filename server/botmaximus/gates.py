@@ -179,7 +179,9 @@ async def _main() -> None:
     try:
         results = await run_all()
         print("\n" + "=" * 72)
-        print("DEPLOYMENT GATES — measured, not self-attested")
+        # ASCII only: this prints to the Windows console, where a non-cp1252
+        # character comes out as a replacement glyph.
+        print("DEPLOYMENT GATES - measured, not self-attested")
         print("=" * 72)
         for r in results:
             print(r.line())

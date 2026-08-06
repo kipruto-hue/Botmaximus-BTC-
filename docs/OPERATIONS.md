@@ -83,6 +83,36 @@ build.
 
 None of this is fixed by more code. It is why the VPS path exists.
 
+### Starting the supervisor so it survives
+
+Start it from **your own session** — the Startup shortcut, or an elevated
+Scheduled Task. A supervisor launched as a child of some other short-lived
+shell (a terminal that closes, an agent tool call, a script that exits) gets
+reaped with its parent, and because it is windowless the only symptom is that
+the collector quietly stops being restarted.
+
+To start it right now without waiting for a logon, detached from whatever shell
+you are in:
+
+```powershell
+$cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden ' +
+       '-File "C:\Users\SPECTRE\botmaximus\ops\supervise.ps1" ' +
+       '-BackupDest "D:\botmaximus-backups"'
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$cmd}
+```
+
+`Win32_Process.Create` starts it under the session rather than under the calling
+shell, so it outlives the terminal. Confirm with a heartbeat line in
+`data/supervisor.log` within 30 minutes; on the VPS, systemd makes all of this
+unnecessary.
+
+### Collector logs
+
+`data/collector.log` and `data/collector.err`, captured by the supervisor. Before
+this existed the collector was started hidden with no redirection and its output
+went nowhere — a startup failure looked identical to a collector that had never
+been asked to start.
+
 ### A gap the strike counter does not cover
 
 Strikes reset on any healthy probe, so a feed that **flaps** — stale, fresh,
