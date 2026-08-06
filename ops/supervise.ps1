@@ -95,8 +95,15 @@ function Start-Server {
         Start-Sleep -Seconds 3
     }
     Write-Log INFO "starting collector"
+    # Capture the collector's own output. Without this it goes nowhere: the
+    # process is started hidden and detached, so a startup failure -- a bad
+    # venue fetch, a Mongo refusal, an import error -- produces a collector that
+    # simply is not there, with no trace of why. That cost real debugging time.
+    $out = Join-Path $root "data\collector.log"
+    $err = Join-Path $root "data\collector.err"
     Start-Process -FilePath $python -ArgumentList '-m','botmaximus.main' `
-        -WorkingDirectory (Join-Path $root "server") -WindowStyle Hidden
+        -WorkingDirectory (Join-Path $root "server") -WindowStyle Hidden `
+        -RedirectStandardOutput $out -RedirectStandardError $err
     $script:lastStart = Get-Date
     $script:strikes = 0
     $script:restarts += ,(Get-Date)
