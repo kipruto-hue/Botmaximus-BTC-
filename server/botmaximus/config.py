@@ -218,6 +218,26 @@ class Settings(BaseSettings):
     gen_max_monthly_usd: float | None = None    # soft budget; breach pauses, never auto-adjusts
     gen_max_content_retries_per_cycle: int = 2
 
+    # ---- Auditor: the THIRD role (Auditor Master Prompt v1.0 §5) ----
+    # Deliberately its own block. §1 of LLM Parameters v1.0 forbids sharing a
+    # temperature constant between roles, and the Auditor sits between the
+    # other two for a reason: reports are prose about facts, so 0 makes every
+    # day's report the same shape (which hides patterns) and 0.9 makes it
+    # invent. 0.4 is readable-but-honest.
+    auditor_llm: str | None = None      # AUDITOR_LLM — fail loudly, like C2
+    aud_temperature: float = 0.4        # 0.2-0.6
+    aud_top_p: float = 0.95
+    aud_max_output_tokens: int = 2500   # 1500-4000, sized to the §4 word bounds
+    aud_stop_sequences: str = "\n\n---END---"
+    aud_seed: int | None = None         # rotated per report, stored in provenance
+    aud_latency_budget_ms: int = 60_000  # not a hot path; timeout = no report
+    aud_max_incidents_per_day: int = 5   # §6 rate limit, then cascade report
+    aud_max_monthly_usd: float | None = None   # §11 soft cap: pause, never adjust
+    #: §8 red-lines. Below the density or above the uncited count, the report is
+    #: prose without evidence and that is itself an incident.
+    aud_min_citation_density: float = 1.0   # citations per 100 words
+    aud_max_uncited_numbers: int = 0        # §1.3: every number is quoted
+
     scr_temperature: float = 0.1        # 0.0-0.3; consistency IS the safety property
     scr_top_p: float = 1.0
     scr_max_output_tokens: int = 250    # enough for a verdict, not for prose that hides reasoning

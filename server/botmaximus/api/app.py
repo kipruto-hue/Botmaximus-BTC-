@@ -206,6 +206,43 @@ async def get_storage():
     }
 
 
+@app.get("/api/auditor/reports")
+async def get_auditor_reports(report_type: str | None = None, limit: int = 20):
+    """§12 Auditor Feed. Read-only by construction: there is no POST, PATCH or
+    DELETE anywhere under /api/auditor, because §1.2 gives the Auditor no
+    pathway to act and an endpoint is a pathway."""
+    from botmaximus.auditor import reports as auditor_reports
+    return {"reports": await auditor_reports.latest(report_type,
+                                                    min(limit, 100))}
+
+
+@app.get("/api/auditor/reports/{report_id}")
+async def get_auditor_report(report_id: str):
+    from botmaximus.auditor import reports as auditor_reports
+    row = await auditor_reports.get(report_id)
+    return row or {"error": "no such report"}
+
+
+@app.get("/api/auditor/verify/{report_id}")
+async def verify_auditor_report(report_id: str):
+    """The 'verify citation' affordance (§12): re-run a report's citations and
+    show what the ledgers say now.
+
+    Only SELECTs are executed — `citations.verify` refuses anything else. The
+    citations are stored strings, and a verify endpoint that could be talked
+    into running an UPDATE would be a hole in an otherwise sealed wall.
+    """
+    from botmaximus.auditor import citations as cit
+    from botmaximus.auditor import reports as auditor_reports
+    row = await auditor_reports.get(report_id)
+    if not row:
+        return {"error": "no such report"}
+    result = await cit.verify([cit.Citation(**c) for c in row["citations"]])
+    return {"report_id": report_id, "checked": result.checked,
+            "passed": result.passed, "mismatches": result.mismatches,
+            "unrunnable": result.unrunnable}
+
+
 @app.get("/api/storage/integrity")
 async def run_storage_integrity():
     """Run the §11 checks now rather than waiting for the hourly job."""

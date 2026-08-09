@@ -537,6 +537,129 @@ CREATE TABLE IF NOT EXISTS schema_version (
     code_version text
 );
 
+-- =====================================================================
+-- The Auditor (Auditor Master Prompt v1.0 §7)
+-- =====================================================================
+-- Reports are records like everything else: never edited, and a correction is
+-- a NEW report with `supersedes` set (§7). The prose lives in Parquet; this
+-- holds the metadata and the citations that make it spot-checkable.
+CREATE TABLE IF NOT EXISTS auditor_provenance (
+    provenance_id       uuid        PRIMARY KEY,
+    model_id            text,
+    prompt_version      text,
+    system_prompt_hash  text,
+    context_hash        text,
+    profile_fingerprint text,
+    seed                bigint,
+    temperature         double precision,
+    top_p               double precision,
+    max_output_tokens   int,
+    input_query_hashes  jsonb,
+    output_response_hash text,
+    code_version        text,
+    producer            text,
+    at                  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS auditor_reports (
+    report_id     uuid        PRIMARY KEY,
+    report_type   text        NOT NULL
+        CHECK (report_type IN ('daily','weekly','incident','cascade')),
+    window_start  timestamptz NOT NULL,
+    window_end    timestamptz NOT NULL,
+    trigger       text        NOT NULL,   -- 'scheduled' | incident event type
+    generated_at  timestamptz NOT NULL DEFAULT now(),
+    -- Each citation is {table, record_id_or_query, quoted_value}. The operator
+    -- re-runs one and compares; a mismatch means the report is wrong, which is
+    -- how a number that drifted into the LLM gets caught (§8).
+    citations     jsonb       NOT NULL DEFAULT '[]',
+    sections      jsonb       NOT NULL DEFAULT '[]',
+    word_count    int         NOT NULL DEFAULT 0,
+    prose_blob_key text,
+    -- A report that quoted a value later superseded gets a follow-up report,
+    -- never an edit (§7). Both stay queryable forever.
+    supersedes    uuid REFERENCES auditor_reports (report_id),
+    provenance_ref uuid REFERENCES auditor_provenance (provenance_id)
+);
+CREATE INDEX IF NOT EXISTS auditor_reports_recent
+    ON auditor_reports (report_type, generated_at DESC);
+CREATE INDEX IF NOT EXISTS auditor_reports_window
+    ON auditor_reports (window_start, window_end);
+
+-- ---------------------------------------------------------------------
+-- §1.1 THE WALL: auditor_read is SELECT-only, on exactly the §3 tables.
+-- ---------------------------------------------------------------------
+-- "Enforced at the database role level, not just at application code level."
+-- Application code can be edited by anyone touching the repo; a role grant
+-- cannot be bypassed by a bug in a query builder.
+--
+-- Note the COLUMN-level grants on scrutiny_events and generations: §3 allows
+-- metadata but not raw prompts/responses, so the blob-key columns are withheld
+-- too. Granting the key would hand out the address of the thing being
+-- withheld, which is most of the way to having it.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'auditor_read') THEN
+        CREATE ROLE auditor_read NOLOGIN;
+    END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA bmx TO auditor_read;
+
+GRANT SELECT ON
+    strategies, strategy_lifecycle_events, strategy_events,
+    trials, arbiter_events,
+    orders, fills,
+    execution_ledger_predictions, execution_ledger_realizations,
+    execution_ledger_drift,
+    kill_events, coverage_ledger, quality_events,
+    telemetry_events, storage_manifest,
+    auditor_reports, auditor_provenance
+TO auditor_read;
+
+-- Metadata only. `prompt_blob_key` / `provenance_blob_key` are deliberately
+-- absent from these column lists.
+GRANT SELECT (intent_id, strategy_id, at, direction, verdict, reason, provider,
+              provider_version, latency_ms, state_key_hash, conviction,
+              realized_known, realized_adverse, realized_return_pct, realized_at)
+    ON scrutiny_events TO auditor_read;
+
+GRANT SELECT (generation_id, strategy_id, at, proposer, model_id,
+              prompt_version, system_prompt_hash, context_hash,
+              profile_fingerprint, temperature, top_p, max_output_tokens, seed,
+              parent_id, lineage_depth, feature_registry_hash, dsl_schema_hash)
+    ON generations TO auditor_read;
+
+-- The compiled DSL blob is withheld entirely: §3 says "hash is enough", and
+-- §14 warns that showing a model exactly what passed produces imitations.
+GRANT SELECT (definition_hash, created_at)
+    ON strategy_definitions_blob TO auditor_read;
+
+-- Everything else stays unreachable. market_records, risk_state, risk_events,
+-- backtest_runs, feature_sets, schema_version, integrity_events, backup_events
+-- and tier_out_events are NOT granted: §3 is an allowlist, and a table added
+-- later is inaccessible until someone deliberately grants it.
+
+-- §9 lists the three things the Auditor DOES write: its own reports, its own
+-- provenance, and telemetry. Separating this from auditor_read means a login
+-- holding both roles can still write nowhere else — the read wall is not
+-- weakened by the fact that reports have to land somewhere.
+--
+-- INSERT only, never UPDATE or DELETE: §14 says reports are never edited or
+-- deleted, and a correction is a new report with `supersedes`. Withholding
+-- UPDATE makes that a permission rather than a promise.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'auditor_write') THEN
+        CREATE ROLE auditor_write NOLOGIN;
+    END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA bmx TO auditor_write;
+GRANT INSERT ON auditor_reports, auditor_provenance, telemetry_events
+    TO auditor_write;
+GRANT USAGE, SELECT ON SEQUENCE telemetry_events_event_id_seq TO auditor_write;
+
 -- ---------------------------------------------------------------------
 -- Additive migrations
 -- ---------------------------------------------------------------------

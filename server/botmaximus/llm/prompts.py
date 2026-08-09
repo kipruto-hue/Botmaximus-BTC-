@@ -19,6 +19,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 GENERATOR_PROMPT = _ROOT / "strategy" / "prompts" / "generator_system.md"
 SCRUTINY_PROMPT = _ROOT / "scrutiny" / "prompts" / "scrutiny_system.md"
+AUDITOR_PROMPT = _ROOT / "auditor" / "prompts" / "auditor_system.md"
 
 _VERSION = re.compile(r"^prompt_version:\s*(\S+)\s*$", re.MULTILINE)
 
@@ -55,3 +56,7 @@ def generator() -> SystemPrompt:
 
 def scrutiny() -> SystemPrompt:
     return load(SCRUTINY_PROMPT, "scrutiny")
+
+
+def auditor() -> SystemPrompt:
+    return load(AUDITOR_PROMPT, "auditor")

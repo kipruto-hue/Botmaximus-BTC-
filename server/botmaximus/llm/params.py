@@ -33,6 +33,12 @@ log = logging.getLogger(__name__)
 GEN_TEMPERATURE_RANGE = (0.7, 1.1)
 GEN_TOP_P_RANGE = (0.9, 1.0)
 SCR_TEMPERATURE_RANGE = (0.0, 0.3)
+#: Auditor (§5). Sits between the other two: hot enough for readable prose,
+#: cold enough not to invent. The token range is bounded at BOTH ends because
+#: the §4 report lengths are bounded at both ends — a 500-token budget cannot
+#: produce a 1500-word weekly review, and truncation is silent.
+AUD_TEMPERATURE_RANGE = (0.2, 0.6)
+AUD_MAX_TOKENS_RANGE = (1500, 4000)
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,11 @@ class DecodingProfile:
     #: Always 1. Sampling several and picking a "best" hides which prompt+seed
     #: produced which output and destroys reproducibility (§6).
     n: int = 1
+    #: Structured-output mode, when the role needs one. The Auditor does: its
+    #: citations have to be machine-verifiable, and citations embedded in free
+    #: prose are citations nothing can check. Defaults to None so Generator and
+    #: Scrutiny are unchanged.
+    response_format: str | None = None
 
     def __post_init__(self) -> None:
         if self.n != 1:
@@ -65,9 +76,12 @@ class DecodingProfile:
         return hashlib.sha256(blob).hexdigest()[:16]
 
     def as_api_kwargs(self) -> dict:
-        return {"temperature": self.temperature, "top_p": self.top_p,
-                "max_output_tokens": self.max_output_tokens,
-                "stop": list(self.stop_sequences), "seed": self.seed, "n": self.n}
+        kw = {"temperature": self.temperature, "top_p": self.top_p,
+              "max_output_tokens": self.max_output_tokens,
+              "stop": list(self.stop_sequences), "seed": self.seed, "n": self.n}
+        if self.response_format:
+            kw["response_format"] = self.response_format
+        return kw
 
 
 def generator_profile(seed: int | None = None) -> DecodingProfile:
@@ -91,6 +105,31 @@ def scrutiny_profile() -> DecodingProfile:
         stop_sequences=(settings.scr_stop_sequences,),
         #: Fixed, not rotated: identical inputs must give identical verdicts.
         seed=settings.scr_seed,
+    )
+
+
+def auditor_profile(seed: int | None = None) -> DecodingProfile:
+    """The third role (§5).
+
+    `seed` rotates per report and is stored in provenance — unlike Scrutiny,
+    whose seed is fixed because identical inputs must give identical verdicts.
+    A report is prose, not a verdict; two runs over the same window may word
+    things differently without either being wrong, and the provenance records
+    which seed produced which text.
+    """
+    t = settings.aud_temperature
+    _assert_range("aud_temperature", t, AUD_TEMPERATURE_RANGE)
+    _assert_range("aud_max_output_tokens", settings.aud_max_output_tokens,
+                  AUD_MAX_TOKENS_RANGE)
+    return DecodingProfile(
+        role="auditor", temperature=t, top_p=settings.aud_top_p,
+        max_output_tokens=settings.aud_max_output_tokens,
+        stop_sequences=(settings.aud_stop_sequences,),
+        seed=seed if seed is not None else settings.aud_seed,
+        #: §5: every citation must be machine-verifiable, which means the
+        #: response has to be structured. Free prose would put the citations
+        #: inside the text where nothing can check them.
+        response_format="json_schema",
     )
 
 
