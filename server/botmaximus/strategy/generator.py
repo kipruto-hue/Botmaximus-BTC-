@@ -49,7 +49,9 @@ from botmaximus.strategy.validator import parse_and_validate, signature, similar
 
 log = logging.getLogger(__name__)
 
-GENERATIONS_DIR = Path(__file__).resolve().parents[3] / "data" / "generations"
+#: There is deliberately no generations directory. Provenance lives in Postgres
+#: (`generations`) and the Parquet archive (§3.G); a local JSON directory is
+#: the stand-in store §14 forbids.
 
 
 def coarsen(reasons: list[str]) -> list[str]:
@@ -66,7 +68,10 @@ class Proposal:
     generation_id: str
     parent_id: str | None = None
     lineage_depth: int = 0
-    provenance_path: Path | None = None
+    #: Archive key of the provenance blob, not a filesystem path. A path is
+    #: only true on the box that wrote it; a key resolves against the store
+    #: that is backed up, mirrored and checksummed.
+    provenance_key: str | None = None
 
 
 @dataclass
@@ -167,11 +172,8 @@ class LLMProposer(Proposer):
 
 
 class Generator:
-    def __init__(self, proposer: Proposer | None = None,
-                 generations_dir: Path | None = None) -> None:
+    def __init__(self, proposer: Proposer | None = None) -> None:
         self.proposer = proposer or NullProposer()
-        self.dir = generations_dir or GENERATIONS_DIR
-        self.dir.mkdir(parents=True, exist_ok=True)
 
     # ---- brief -------------------------------------------------------
     async def build_brief(self, population: list[dict] | None = None,
@@ -235,12 +237,12 @@ class Generator:
             existing.append(sig)
 
             gen_id = uuid.uuid4().hex
-            path = await self._write_provenance(
+            ref = await self._write_provenance(
                 gen_id, defn, brief, payload, parent, lineage_depth)
             outcome.accepted.append(Proposal(
                 definition=defn, generation_id=gen_id,
                 parent_id=parent.id if parent else None,
-                lineage_depth=lineage_depth, provenance_path=path))
+                lineage_depth=lineage_depth, provenance_key=ref.blob_key))
 
         log.info("generation: proposed=%d accepted=%d duplicates=%d malformed=%d",
                  outcome.proposed, len(outcome.accepted),
@@ -258,28 +260,30 @@ class Generator:
     async def _write_provenance(self, gen_id: str, defn: StrategyDefinition,
                                 brief: dict, raw: dict,
                                 parent: StrategyDefinition | None,
-                                lineage_depth: int) -> Path:
-        from botmaximus.features.registry import FEATURE_REGISTRY
+                                lineage_depth: int):
+        """A `generations` row in Postgres + the full brief and response as a
+        Parquet blob (§3.G).
 
-        doc = {
-            "generation_id": gen_id,
-            "strategy_id": defn.id,
-            "at": datetime.now(timezone.utc).isoformat(),
-            "proposer": self.proposer.name,
-            "model": settings.generation_llm,
-            "brief": brief,
-            "raw_response": raw,
-            "parent_id": parent.id if parent else None,
-            "lineage_depth": lineage_depth,
-            "feature_registry_hash": hashlib.sha256(
+        This used to be `data/generations/<id>.json`, which §14 forbids: a
+        local file is on one box, in no backup, in no manifest, and gone when
+        the VPS is rebuilt — while §3.G leans on the blob still being there at
+        validation time.
+        """
+        from botmaximus.features.registry import FEATURE_REGISTRY
+        from botmaximus.storage import provenance
+
+        return await provenance.record_generation(
+            generation_id=gen_id,
+            strategy_id=defn.id,
+            proposer=self.proposer.name,
+            brief=brief,
+            raw_response=raw,
+            model_id=settings.generation_llm,
+            parent_id=parent.id if parent else None,
+            lineage_depth=lineage_depth,
+            feature_registry_hash=hashlib.sha256(
                 json.dumps(sorted(FEATURE_REGISTRY)).encode()).hexdigest()[:16],
-            "brief_hash": hashlib.sha256(
-                json.dumps(brief, sort_keys=True, default=str).encode()
-            ).hexdigest()[:16],
-        }
-        path = self.dir / f"{gen_id}.json"
-        path.write_text(json.dumps(doc, indent=2, default=str), encoding="utf-8")
-        return path
+        )
 
     # ---- validation entry point --------------------------------------
     async def validate_proposal(self, proposal: Proposal, start, end,
@@ -291,7 +295,8 @@ class Generator:
         passes the count to `validate(n_trials=…)`; asserting the provenance
         precondition here keeps both invariants at one door.
         """
-        if proposal.provenance_path is None or not proposal.provenance_path.exists():
+        from botmaximus.storage import provenance
+        if not provenance.blob_exists(proposal.provenance_key):
             raise RuntimeError(
                 f"{proposal.definition.id} has no provenance record — refusing "
                 f"to validate. A strategy that cannot be reproduced cannot be "

@@ -49,12 +49,20 @@ class TierOutJob:
         self.interval_s = interval_s
 
     async def run(self) -> None:
-        from botmaximus.storage import tiering
+        from botmaximus.storage import snapshots, tiering
         while True:
             delay = (self.interval_s if self.interval_s is not None
                      else seconds_until(TIER_OUT_HOUR, TIER_OUT_MINUTE))
             await asyncio.sleep(delay)
             try:
+                # Snapshot BEFORE tiering. The coverage ledger describes days
+                # that tier-out is about to drop from the hot window, and the
+                # money export reads tables tier-out does not touch — but
+                # ordering them this way means a snapshot can never miss a day
+                # that was archived and dropped in the same cycle.
+                snap = await snapshots.run_nightly()
+                log.info("[%s] nightly snapshots: %s", self.name, snap)
+
                 results = await tiering.run_tier_out()
                 dropped = [r for r in results if r.dropped]
                 refused = [r for r in results if r.checks and not r.verified]

@@ -291,7 +291,18 @@ async def status(limit: int = 50) -> dict:
     last_drill = await postgres.fetchrow(
         "SELECT * FROM backup_events WHERE kind = 'restore_drill' "
         "AND succeeded ORDER BY at DESC LIMIT 1")
+    last_mirror = await postgres.fetchrow(
+        "SELECT * FROM backup_events WHERE kind = 'mirror_sync' AND succeeded "
+        "ORDER BY at DESC LIMIT 1")
+    # §11 wants mirror LAG, not just a timestamp: "the mirror ran once, months
+    # ago" and "the mirror is current" render identically as a date.
+    mirror_lag_s = (
+        (datetime.now(UTC) - last_mirror["at"]).total_seconds()
+        if last_mirror else None)
     return {
+        "mirror_last_sync_at": (last_mirror["at"].isoformat()
+                                if last_mirror else None),
+        "mirror_lag_seconds": mirror_lag_s,
         "recent": [json.loads(json.dumps(dict(r), default=str)) for r in rows],
         "failing": [json.loads(json.dumps(dict(r), default=str))
                     for r in rows if not r["passed"]],

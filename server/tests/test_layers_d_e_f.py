@@ -72,6 +72,16 @@ def db(pg):
     return pg
 
 
+@pytest.fixture
+def local_archive(tmp_path):
+    from botmaximus.storage import records as store_mod
+    from botmaximus.storage.archive import Archive, LocalBackend
+    a = Archive(LocalBackend(tmp_path), "archive", "quarantine")
+    store_mod.set_archive_for_tests(a)
+    yield a
+    store_mod.reset_for_tests()
+
+
 def sig(sid="s1", direction="LONG", conf=0.8, **kw):
     return StrategySignal(strategy_id=sid, direction=direction, confidence=conf,
                           entry_price=64_000.0, stop_price=63_500.0, **kw)
@@ -350,7 +360,21 @@ async def test_validation_is_refused_without_provenance(db):
     from botmaximus.strategy.seeds import seed_definitions
 
     p = Proposal(definition=seed_definitions()[0], generation_id="x",
-                 provenance_path=None)
+                 provenance_key=None)
+    with pytest.raises(RuntimeError, match="no provenance"):
+        await Generator(NullProposer()).validate_proposal(p, None, None)
+
+
+@pytest.mark.asyncio
+async def test_validation_is_refused_when_the_blob_is_gone(db, local_archive):
+    """A key that points at nothing is not provenance. The check asks the
+    archive, not the local filesystem — a path is only true on the box that
+    wrote it."""
+    from botmaximus.strategy.generator import Proposal
+    from botmaximus.strategy.seeds import seed_definitions
+
+    p = Proposal(definition=seed_definitions()[0], generation_id="x",
+                 provenance_key="provenance/generation/year=2026/nope.parquet")
     with pytest.raises(RuntimeError, match="no provenance"):
         await Generator(NullProposer()).validate_proposal(p, None, None)
 
@@ -364,13 +388,57 @@ async def test_a_repair_beyond_the_lineage_cap_is_refused(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proposals_get_provenance_files(db, monkeypatch, tmp_path):
+async def test_proposals_get_provenance_in_both_stores(db, monkeypatch,
+                                                       local_archive):
+    """§3.G: structured fields in Postgres, full brief and response in Parquet.
+
+    Replaces a test that asserted a local JSON file existed — which §14
+    forbids, and which would have passed on a box that happened to still have
+    the file while the record was absent from every backup.
+    """
+    from botmaximus.storage import provenance
+
     monkeypatch.setattr(settings, "candidate_cap_per_cycle", 2)
-    g = Generator(NullProposer(), generations_dir=tmp_path)
-    out = await g.generate()
+    out = await Generator(NullProposer()).generate()
     assert out.proposed == 2
+
     for p in out.accepted:
-        assert p.provenance_path.exists()
+        assert provenance.blob_exists(p.provenance_key)
+        blob = await provenance.read_blob(p.provenance_key)
+        assert "brief" in blob and "raw_response" in blob
+
+    rows = await db.fetch("SELECT * FROM generations")
+    assert len(rows) == len(out.accepted)
+    assert all(r["provenance_blob_key"] for r in rows)
+    # ...and the archive object is indexed, so the checksum audit can see it.
+    keys = {r["provenance_blob_key"] for r in rows}
+    manifest = await db.fetch(
+        "SELECT object_key FROM storage_manifest WHERE object_key = ANY(%s)",
+        (list(keys),))
+    assert len(manifest) == len(keys)
+
+
+@pytest.mark.asyncio
+async def test_a_generation_is_not_recorded_if_its_blob_cannot_be_archived(
+        db, monkeypatch):
+    """Blob first, then the row. A row pointing at a blob that was never
+    written would pass the existence check against nothing."""
+    from botmaximus.storage import provenance
+    from botmaximus.storage import records as store_mod
+    from botmaximus.storage.archive import Archive, LocalBackend
+
+    class Broken(LocalBackend):
+        def put(self, bucket, key, data):
+            raise OSError("object storage unreachable")
+
+    store_mod.set_archive_for_tests(Archive(Broken("/nope"), "archive", "q"))
+    try:
+        with pytest.raises(provenance.ProvenanceUnavailable):
+            await provenance.record_generation(
+                strategy_id="s1", proposer="test", brief={}, raw_response={})
+    finally:
+        store_mod.reset_for_tests()
+    assert await db.fetchval("SELECT count(*) AS n FROM generations") == 0
 
 
 # =====================================================================
