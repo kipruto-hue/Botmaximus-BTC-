@@ -160,6 +160,49 @@ stored anything reads as unhealthy and restart-loops it.
 
 ---
 
+## The TradeLoop (and why it is off)
+
+Source of truth: **TradeLoop Orchestrator Master Prompt v1.0**.
+
+The coordinator that walks a signal through Arbiter → Scrutiny → Risk →
+Execute → Ledger lives at `server/botmaximus/orchestrator/trade_loop.py`. It is
+**OFF by default**, and that is a correct boot state rather than a fault: no
+strategy has cleared Gate 3, so nothing is in `paper`/`micro`/`full` and a
+running loop would faithfully do nothing.
+
+Every boot logs exactly one `[TradeLoop]` line saying which state it is in and
+why — including a census of the strategy pool. This exists because an audit
+found the entire decision chain built, tested, and never called, with nothing
+anywhere saying so. Inert-by-design and inert-by-accident looked identical.
+
+```ini
+# server/.env
+TRADE_LOOP_ENABLED=false                          # the default
+TRADE_WINDOW_LOCAL=Africa/Nairobi:15:30-17:30     # optional; parsed at boot
+```
+
+Enabling is `.env` plus a restart — deliberately never an HTTP endpoint, since
+a route that can start trading is an attack surface. With the flag true,
+startup **aborts** unless `require_trading()` passes (Bybit credentials
+present). A process that comes up with a half-wired trade loop is worse than
+one that refuses to come up, because the first looks healthy.
+
+The kill stack can stop the loop at runtime (L2 halts entries, L3 stops and
+flattens) but cannot re-enable it.
+
+**One thing to know before enabling.** Live signal generation from compiled DSL
+strategies does not exist yet — strategies evaluate against a historical
+`MarketWindow` during backtest, and there is no live evaluator. So a populated
+pool still produces no signals, and the loop reports `no_live_evaluator`
+rather than a bland `no_signals`, precisely so that gap cannot hide the way the
+missing orchestrator did.
+
+Every bar-close event writes one `telemetry_events` row (`kind='trade_loop_bar'`)
+with the outcome, the stage that produced it, and the reason — so the Auditor's
+daily rundown can say "240 bars: 12 no_signals, 226 blocked_scrutiny, 2 executed".
+
+---
+
 ## Backups
 
 > **Storage v2.0 (2026-08-09): Postgres is the store now.** Use

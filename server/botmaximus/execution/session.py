@@ -54,6 +54,36 @@ class Session:
             label=s.get("label", ""),
         )
 
+    @classmethod
+    def from_settings(cls) -> "Session | None":
+        """Build from `TRADE_WINDOW_LOCAL`, e.g. `Africa/Nairobi:15:30-17:30`.
+
+        Returns None when unset. The setting has documented that format since it
+        was introduced and nothing ever parsed it — the TradeLoop is the first
+        caller, and a window nobody reads is a window that is not enforced.
+
+        A malformed value raises rather than defaulting to "always open":
+        silently trading around the clock because a colon was missing is
+        exactly the class of configuration accident this project refuses.
+        """
+        from botmaximus.config import settings
+
+        raw = (settings.trade_window_local or "").strip()
+        if not raw:
+            return None
+        try:
+            tz, _, span = raw.partition(":")
+            start_s, _, end_s = span.partition("-")
+            return cls(enabled=True, tz=tz.strip(),
+                       start=_parse_hhmm(start_s.strip()),
+                       end=_parse_hhmm(end_s.strip()), label=raw)
+        except Exception as e:                          # noqa: BLE001
+            raise ValueError(
+                f"TRADE_WINDOW_LOCAL={raw!r} is not "
+                f"'<Area/City>:<HH:MM>-<HH:MM>' ({e}). Refusing to fall back to "
+                f"an always-open window — that would trade around the clock "
+                f"because of a typo.") from e
+
     @property
     def zone(self) -> ZoneInfo:
         # Raises immediately on an unknown zone rather than silently falling

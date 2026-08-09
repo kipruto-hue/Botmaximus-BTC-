@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from botmaximus.config import settings
 from botmaximus.db.schema import DATASETS, ensure_schema
+from botmaximus.orchestrator import startup as orchestrator_startup
 from botmaximus.storage import degrade as storage_degrade
 from botmaximus.storage import jobs as storage_jobs
 from botmaximus.storage import postgres
@@ -127,6 +128,13 @@ async def lifespan(app: FastAPI):
     # hourly, checksum audit weekly (§4, §8, §11). They are supervised the same
     # way, because a storage job that dies silently leaves the condition it was
     # watching for unobserved.
+    # The TradeLoop: OFF unless the operator turned it on. Built here, before
+    # collectors start, so that an enabled-but-unwireable loop aborts startup
+    # rather than coming up looking healthy (§6). When disabled this constructs
+    # nothing and boot behaviour is unchanged.
+    trade_loop = await orchestrator_startup.build(pipeline=pipeline,
+                                                  risk_core=risk_core)
+
     sources = (_venue_sources(pipeline.gather_q) + [CoverageHeartbeat()]
                + storage_jobs.all_jobs())
     log.info("venue: %s (%s %s)", settings.venue, settings.symbol,
@@ -142,6 +150,8 @@ async def lifespan(app: FastAPI):
             t.cancel()
         await asyncio.gather(*source_tasks, return_exceptions=True)
         await pipeline.stop()
+        if trade_loop is not None:
+            orchestrator_startup.log_stopped()
         await postgres.close()
 
 

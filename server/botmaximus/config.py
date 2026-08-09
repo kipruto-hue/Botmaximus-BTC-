@@ -191,7 +191,16 @@ class Settings(BaseSettings):
     arbiter_cooldown_s: int = 300
     #: "Africa/Nairobi:15:30-17:30". Unset means no window is enforced, which
     #: the executor treats as a configuration error rather than "always open".
+    #: Parsed by `Session.from_settings()`.
     trade_window_local: str | None = None
+
+    # ---- the TradeLoop (TradeLoop Orchestrator v1.0) ----
+    #: OFF by default, and that is a correct boot state rather than a fault:
+    #: no strategy has cleared Gate 3, so a running loop would faithfully do
+    #: nothing. Enabling is an operator commit — `.env` plus a restart, never
+    #: an HTTP endpoint, because a route that can start trading is an attack
+    #: surface. Every boot logs which state this is in and why (§5).
+    trade_loop_enabled: bool = False
     #: `taker` | `maker_first_then_taker`. The second implements the audit's
     #: maker-entry test: at 5.5bps taker each side, fee is the dominant term.
     order_entry_style: str = "taker"

@@ -40,6 +40,8 @@ class Pipeline:
         self.parse_q: asyncio.Queue[Envelope] = asyncio.Queue(maxsize=settings.queue_maxsize)
         self.store_q: asyncio.Queue[Envelope] = asyncio.Queue(maxsize=settings.queue_maxsize)
         self._tasks: list[asyncio.Task] = []
+        #: Async callbacks fired on each stored, confirmed 1m candle.
+        self._bar_close_subs: list = []
 
     def start(self) -> None:
         self._tasks = [
@@ -96,3 +98,34 @@ class Pipeline:
                 continue
             store_ms = (time.perf_counter() - t0) * 1000
             telemetry.record_stage(env.dataset_id, "store", store_ms)
+            await self._emit_bar_close(env)
+
+    # ---- bar-close event (TradeLoop v1.0 §2.2) --------------------------
+    def subscribe_bar_close(self, callback) -> None:
+        """Register an async callback fired after a closed 1m candle is stored.
+
+        The TradeLoop is event-driven on bar close (§1.6) and there was no such
+        event to subscribe to — this pipeline is queues end to end. The event
+        fires *after* the write, not before: a decision taken on a bar that
+        failed to store would be a decision on data the system does not have.
+        """
+        self._bar_close_subs.append(callback)
+
+    async def _emit_bar_close(self, env: Envelope) -> None:
+        """Notify subscribers that a confirmed 1m candle landed.
+
+        Backfilled candles are excluded: they arrive to heal a hole in history
+        and are not news. Firing on them would have the loop evaluate a bar
+        from last Tuesday as though it had just closed.
+
+        A subscriber that raises must never break the store path — losing a
+        trading decision is survivable, losing the data is not.
+        """
+        if env.dataset_id != "btc_ohlcv_1m" or env.backfill:
+            return
+        for cb in self._bar_close_subs:
+            try:
+                await cb(env)
+            except Exception:                           # noqa: BLE001
+                log.exception("bar-close subscriber failed for %s",
+                              env.event_time)
