@@ -130,12 +130,12 @@ class DecayMonitor:
     async def _cost_drift(self, strategy_id: str) -> dict | None:
         """Realized vs predicted cost over the rolling leg window."""
         try:
-            from botmaximus.db.mongo import get_db
-            cursor = get_db()[LEDGER].find(
-                {"strategy_id": strategy_id, "status": RECONCILED},
-                {"_id": 0, "drift": 1, "predicted_fee": 1},
-            ).sort("decision_time", -1).limit(settings.auto_demote_leg_window)
-            rows = [d async for d in cursor]
+            from botmaximus.storage import postgres
+            rows = await postgres.fetch(
+                "SELECT drift, predicted_fee FROM execution_ledger "
+                "WHERE strategy_id = %s AND status = %s "
+                "ORDER BY decision_time DESC LIMIT %s",
+                (strategy_id, RECONCILED, settings.auto_demote_leg_window))
         except Exception:                               # noqa: BLE001
             return None
         if len(rows) < settings.auto_demote_leg_window:
@@ -162,13 +162,15 @@ class DecayMonitor:
             return
         await self.risk.kills.suspend_strategy(verdict.strategy_id, verdict.cause)
         try:
-            from botmaximus.db.mongo import get_db
-            await get_db()[DECAY_EVENTS].insert_one({
-                "strategy_id": verdict.strategy_id,
-                "cause": verdict.cause,
-                "detail": verdict.detail,
-                "at": datetime.now(timezone.utc),
-            })
+            import json
+
+            from botmaximus.storage import postgres
+            await postgres.execute(
+                "INSERT INTO strategy_events (strategy_id, event, at, detail) "
+                "VALUES (%s, %s, %s, %s)",
+                (verdict.strategy_id, "decay", datetime.now(timezone.utc),
+                 json.dumps({"cause": verdict.cause,
+                             "detail": verdict.detail}, default=str)))
         except Exception as e:                          # noqa: BLE001
             from botmaximus.obs import degradation
             await degradation.record("decay_event_write_failed", str(e))
@@ -177,6 +179,5 @@ class DecayMonitor:
 
 
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[DECAY_EVENTS].create_index([("strategy_id", 1), ("at", -1)])
+    """No-op: indexes are part of `schema.sql`."""
+    return None

@@ -72,11 +72,12 @@ def window(now: datetime | None = None) -> tuple[datetime, datetime]:
 
 
 async def is_burned(strategy_id: str) -> bool:
-    from botmaximus.db.mongo import get_db
-    from botmaximus.strategy.store import STRATEGY_EVENTS
-    doc = await get_db()[STRATEGY_EVENTS].find_one(
-        {"strategy_id": strategy_id, "event": HOLDOUT_EVENT})
-    return doc is not None
+    from botmaximus.storage import postgres
+    row = await postgres.fetchrow(
+        "SELECT 1 AS x FROM strategy_events "
+        "WHERE strategy_id = %s AND event = %s LIMIT 1",
+        (strategy_id, HOLDOUT_EVENT))
+    return row is not None
 
 
 async def assert_unburned(strategy_id: str) -> None:
@@ -90,12 +91,13 @@ async def assert_unburned(strategy_id: str) -> None:
 async def record_burn(strategy_id: str, verdict: dict, window_: tuple) -> None:
     """Append-only, and written *before* the verdict is returned to the caller —
     a holdout run that crashes after the backtest still counts as spent."""
-    from botmaximus.db.mongo import get_db
-    from botmaximus.strategy.store import STRATEGY_EVENTS
-    await get_db()[STRATEGY_EVENTS].insert_one({
-        "strategy_id": strategy_id,
-        "event": HOLDOUT_EVENT,
-        "at": datetime.now(timezone.utc),
-        "window": [window_[0].isoformat(), window_[1].isoformat()],
-        "verdict": verdict,
-    })
+    import json
+
+    from botmaximus.storage import postgres
+    await postgres.execute(
+        "INSERT INTO strategy_events (strategy_id, event, detail) "
+        "VALUES (%s, %s, %s)",
+        (strategy_id, HOLDOUT_EVENT, json.dumps({
+            "window": [window_[0].isoformat(), window_[1].isoformat()],
+            "verdict": verdict,
+        }, default=str)))

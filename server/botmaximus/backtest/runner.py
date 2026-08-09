@@ -7,7 +7,7 @@ is pure — no venue, no kills touched during a backtest).
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from botmaximus.backtest import data, holdout, store
 from botmaximus.backtest.costs import CostModel
@@ -18,9 +18,33 @@ from botmaximus.backtest.validation import validate
 from botmaximus.config import settings
 
 
+def pin_as_of(as_of: datetime | None) -> datetime:
+    """Every run is pinned to an instant (§6).
+
+    A run with no `as_of` reads whatever the store currently says, so re-running
+    it later silently measures a different world — including any corrections
+    that arrived in between. That is the defect §6 names, so there is no
+    unpinned path: omitting it means "now", and "now" is captured here, once, at
+    run start, and recorded with the result.
+
+    Refusing outright instead of defaulting would be worse rather than stricter:
+    callers would pass `datetime.now()` themselves and the pin would drift
+    across the several loads a single run performs.
+    """
+    if as_of is None:
+        return datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        raise ValueError(
+            "as_of must be timezone-aware — a naive instant means something "
+            "different on the Tokyo VPS than on a desktop")
+    return as_of
+
+
 async def run_backtest(strategy: Strategy, start: datetime, end: datetime,
                        allow_gaps: bool = False, warmup: int = 60,
-                       persist: bool = True) -> dict:
+                       persist: bool = True,
+                       as_of: datetime | None = None) -> dict:
+    as_of = pin_as_of(as_of)
     # §2.4 — refuse phantom-coverage windows for every required feed.
     # `required_feeds` may be DSL feed names (ohlcv/funding/…) or raw dataset
     # ids; both resolve to the dataset the coverage ledger tracks.
@@ -30,14 +54,13 @@ async def run_backtest(strategy: Strategy, start: datetime, end: datetime,
         coverage_summaries[feed] = await data.assert_coverage(
             dataset, start, end, allow_gaps)
 
-    bars = await data.load_ohlcv(start, end)
+    bars = await data.load_ohlcv(start, end, as_of)
     if len(bars) <= warmup:
         raise data.CoverageError(f"only {len(bars)} bars — need > warmup {warmup}")
-    funding = await data.load_funding(start, end)
+    funding = await data.load_funding(start, end, as_of)
 
-    from botmaximus.db.mongo import get_db
     from botmaximus.risk.core import RiskCore
-    risk = RiskCore(get_db())
+    risk = RiskCore()
     cost_model = CostModel(funding=funding)
     # A compiled DSL strategy carries its own exit policy; anything else gets
     # the defaults, which are the pre-Pass-C behaviour.
@@ -57,7 +80,8 @@ async def run_backtest(strategy: Strategy, start: datetime, end: datetime,
         "min_trades": settings.bt_min_trades,
         "candidate_trials": settings.bt_candidate_trials,
     }
-    doc = store.build_run_doc(strategy.id, config, coverage_summaries, result, verdict)
+    doc = store.build_run_doc(strategy.id, config, coverage_summaries, result,
+                              verdict, as_of=as_of)
     if persist:
         await store.save_run(doc)
 
@@ -71,7 +95,8 @@ async def run_backtest(strategy: Strategy, start: datetime, end: datetime,
 
 async def run_dsl_backtest(defn, start: datetime, end: datetime,
                            allow_gaps: bool = False, warmup: int = 200,
-                           persist: bool = True, holdout_run: bool = False) -> dict:
+                           persist: bool = True, holdout_run: bool = False,
+                           as_of: datetime | None = None) -> dict:
     """Gate 3 path: a validated StrategyDefinition → compiled → replayed →
     judged. The strategy is compiled against the *same* MarketWindow the replay
     walks, so features and bars cannot disagree about what happened when.
@@ -90,6 +115,7 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
     from botmaximus.strategy import trials
     from botmaximus.strategy.compiler import compile_strategy
 
+    as_of = pin_as_of(as_of)
     if holdout_run:
         await holdout.assert_unburned(defn.id)
     else:
@@ -101,16 +127,15 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
         coverage_summaries[feed] = await data.assert_coverage(
             dataset, start, end, allow_gaps)
 
-    market = await data.load_window(defn.required_feeds, start, end)
+    market = await data.load_window(defn.required_feeds, start, end, as_of)
     if len(market.bars) <= warmup:
         raise data.CoverageError(
             f"only {len(market.bars)} bars — need > warmup {warmup}")
 
     strategy = compile_strategy(defn, market)
 
-    from botmaximus.db.mongo import get_db
     from botmaximus.risk.core import RiskCore
-    risk = RiskCore(get_db())
+    risk = RiskCore()
     bt = Backtester(CostModel(funding=market.funding), risk,
                     policy=strategy.exit_policy)
     result = bt.run(market.bars, strategy, warmup=warmup)
@@ -139,7 +164,8 @@ async def run_dsl_backtest(defn, start: datetime, end: datetime,
     regime_of = regime_lookup(build_regime_map(market.bars))
     verdict = validate(result, regime_of, n_trials=n_trials)
 
-    doc = store.build_run_doc(defn.id, config, coverage_summaries, result, verdict)
+    doc = store.build_run_doc(defn.id, config, coverage_summaries, result,
+                              verdict, as_of=as_of)
     doc["n_trials"] = n_trials
     doc["holdout"] = holdout_run
     if persist:

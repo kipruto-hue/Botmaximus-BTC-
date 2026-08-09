@@ -17,27 +17,6 @@ from botmaximus.risk.kills import L3_RESET_TOKEN
 from botmaximus.risk.state import OrderIntent, Rejection, SizedOrder
 
 
-class FakeCollection:
-    def __init__(self):
-        self.docs = {}
-        self.inserted = []
-
-    async def find_one(self, query):
-        return self.docs.get(query.get("_id"))
-
-    async def replace_one(self, query, doc, upsert=False):
-        self.docs[query["_id"]] = doc
-
-    async def insert_one(self, doc):
-        self.inserted.append(doc)
-
-
-class FakeDB(dict):
-    def __missing__(self, key):
-        self[key] = FakeCollection()
-        return self[key]
-
-
 ENTRY = 66_000.0
 
 
@@ -55,7 +34,7 @@ def intent(strategy="S1", direction="LONG", entry=ENTRY, stop=None, **kw):
 
 
 async def make_core():
-    core = RiskCore(FakeDB())
+    core = RiskCore()
     await core.load()
     fresh_feeds()
     return core
@@ -64,7 +43,7 @@ async def make_core():
 # ---------------- sizing (§4.1) ----------------
 
 @pytest.mark.asyncio
-async def test_sizing_derives_qty_from_risk():
+async def test_sizing_derives_qty_from_risk(pg):
     core = await make_core()
     sized = core.size_intent(intent())
     assert isinstance(sized, SizedOrder)
@@ -74,7 +53,7 @@ async def test_sizing_derives_qty_from_risk():
 
 
 @pytest.mark.asyncio
-async def test_wrong_side_stop_rejected():
+async def test_wrong_side_stop_rejected(pg):
     core = await make_core()
     out = core.size_intent(intent(stop=ENTRY + 100))  # stop above entry on a LONG
     assert isinstance(out, Rejection)
@@ -82,7 +61,7 @@ async def test_wrong_side_stop_rejected():
 
 
 @pytest.mark.asyncio
-async def test_tight_stop_implies_oversized_leverage_rejected():
+async def test_tight_stop_implies_oversized_leverage_rejected(pg):
     core = await make_core()
     sized = core.size_intent(intent(stop=ENTRY - 33))  # 0.05% stop → huge notional
     assert isinstance(sized, SizedOrder)
@@ -93,7 +72,7 @@ async def test_tight_stop_implies_oversized_leverage_rejected():
 
 
 @pytest.mark.asyncio
-async def test_cumulative_open_risk_cap_enforced():
+async def test_cumulative_open_risk_cap_enforced(pg):
     core = await make_core()
     approved = 0
     for i in range(6):
@@ -110,7 +89,7 @@ async def test_cumulative_open_risk_cap_enforced():
 
 
 @pytest.mark.asyncio
-async def test_stop_beyond_liquidation_rejected():
+async def test_stop_beyond_liquidation_rejected(pg):
     core = await make_core()
     liq = RiskCore._liquidation_price("LONG", ENTRY)
     bad = SizedOrder(
@@ -126,7 +105,7 @@ async def test_stop_beyond_liquidation_rejected():
 # ---------------- kill stack (§4.3) ----------------
 
 @pytest.mark.asyncio
-async def test_l1_suspends_one_strategy_not_others():
+async def test_l1_suspends_one_strategy_not_others(pg):
     core = await make_core()
     await core.kills.suspend_strategy("BAD", "decay breach")
     rej = await core.pre_trade_check(core.size_intent(intent(strategy="BAD")))
@@ -136,7 +115,7 @@ async def test_l1_suspends_one_strategy_not_others():
 
 
 @pytest.mark.asyncio
-async def test_l2_halts_new_entries():
+async def test_l2_halts_new_entries(pg):
     core = await make_core()
     await core.kills.halt_portfolio("abnormal slippage")
     verdict = await core.pre_trade_check(core.size_intent(intent()))
@@ -145,7 +124,7 @@ async def test_l2_halts_new_entries():
 
 
 @pytest.mark.asyncio
-async def test_l2_fires_on_daily_loss_limit():
+async def test_l2_fires_on_daily_loss_limit(pg):
     core = await make_core()
     loss = 1 - (settings.daily_loss_limit_pct + 0.5) / 100
     await core.update_equity(settings.starting_equity_paper * loss)
@@ -153,7 +132,7 @@ async def test_l2_fires_on_daily_loss_limit():
 
 
 @pytest.mark.asyncio
-async def test_l3_fires_on_drawdown_breach_and_blocks_everything():
+async def test_l3_fires_on_drawdown_breach_and_blocks_everything(pg):
     core = await make_core()
     dd = 1 - (settings.max_drawdown_kill_pct + 1) / 100
     await core.update_equity(settings.starting_equity_paper * dd)
@@ -164,7 +143,7 @@ async def test_l3_fires_on_drawdown_breach_and_blocks_everything():
 
 
 @pytest.mark.asyncio
-async def test_operator_master_kill_and_token_reset():
+async def test_operator_master_kill_and_token_reset(pg):
     core = await make_core()
     await core.kills.master_kill("operator")
     assert core.kills.blocks_trading()
@@ -175,14 +154,13 @@ async def test_operator_master_kill_and_token_reset():
 
 
 @pytest.mark.asyncio
-async def test_kill_state_survives_process_restart():
-    db = FakeDB()
-    core1 = RiskCore(db)
+async def test_kill_state_survives_process_restart(pg):
+    core1 = RiskCore()
     await core1.load()
     fresh_feeds()
     await core1.kills.master_kill("drawdown breach")
 
-    core2 = RiskCore(db)                       # simulated restart, same store
+    core2 = RiskCore()                       # simulated restart, same store
     await core2.load()
     assert core2.kills.l3_killed is not None
     verdict = await core2.pre_trade_check(core2.size_intent(intent()))
@@ -190,15 +168,14 @@ async def test_kill_state_survives_process_restart():
 
 
 @pytest.mark.asyncio
-async def test_equity_and_peak_survive_restart():
-    db = FakeDB()
-    core1 = RiskCore(db)
+async def test_equity_and_peak_survive_restart(pg):
+    core1 = RiskCore()
     await core1.load()
     fresh_feeds()
     await core1.update_equity(11_000)
     await core1.update_equity(10_500)
 
-    core2 = RiskCore(db)
+    core2 = RiskCore()
     await core2.load()
     assert core2.portfolio.peak_equity == 11_000
     assert core2.portfolio.equity == 10_500
@@ -207,7 +184,7 @@ async def test_equity_and_peak_survive_restart():
 # ---------------- data-dependency checks (§4.2) ----------------
 
 @pytest.mark.asyncio
-async def test_stale_feed_blocks_entry():
+async def test_stale_feed_blocks_entry(pg):
     core = await make_core()
     telemetry._last_event["btc_price_tick"] = utcnow() - timedelta(minutes=5)
     try:
@@ -219,7 +196,7 @@ async def test_stale_feed_blocks_entry():
 
 
 @pytest.mark.asyncio
-async def test_edge_below_cost_margin_rejected():
+async def test_edge_below_cost_margin_rejected(pg):
     core = await make_core()
     weak = intent(expected_edge_pct=0.10, expected_cost_pct=0.10)  # needs 1.5×
     verdict = await core.pre_trade_check(core.size_intent(weak))
@@ -228,10 +205,12 @@ async def test_edge_below_cost_margin_rejected():
 
 
 @pytest.mark.asyncio
-async def test_every_verdict_is_logged():
+async def test_every_verdict_is_logged(pg):
     core = await make_core()
     await core.pre_trade_check(core.size_intent(intent()))
-    events = core._db["risk_events"].inserted
+    events = await pg.fetch("SELECT * FROM risk_events ORDER BY event_id")
     assert len(events) == 1
     assert events[0]["kind"] in ("approved", "rejected")
     assert events[0]["strategy_id"] == "S1"
+    # §2.7 wants the reason recoverable, not just the outcome.
+    assert events[0]["detail"]["direction"] == "LONG"

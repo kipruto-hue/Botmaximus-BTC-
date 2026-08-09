@@ -11,14 +11,41 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # storage
-    mongo_uri: str = "mongodb://localhost:27017"
-    # Per-venue database. Binance and Bybit disagree about price, funding,
-    # liquidity and even what a bar contains, and nothing downstream filters on
-    # `source` — the coverage ledger, the backtester and the feature layer would
-    # blend two venues into one series without a word. Separating at the
-    # database keeps that impossible instead of merely discouraged, and leaves
-    # the Binance era intact in `botmaximus` for comparison.
-    db_name: str = "botmaximus_bybit"
+    # ---- storage: two stores, both on Vultr (Storage Architecture v2.0) ----
+    # Postgres owns everything the system decides or commits, plus the recent
+    # hot window. Parquet on Object Storage owns the immutable permanent
+    # record. There is no third store: no Redis, no cache layer, no local
+    # JSON/CSV stand-in. MongoDB was cancelled permanently on 2026-08-06.
+    postgres_dsn: str = "postgresql://botmaximus@127.0.0.1:5432/botmaximus"
+    postgres_pool_min: int = 2
+    postgres_pool_max: int = 10
+    #: Per-dataset hot-window overrides (§3.A). Older data lives only in
+    #: Parquet; the tier-out job drops the Postgres partition after verifying
+    #: the archive copy — never before.
+    hot_window_hours_default: int = 48
+    hot_window_hours_ohlcv: int = 168        # 7d
+    hot_window_hours_ticks: int = 24
+    hot_window_hours_funding: int = 720      # 30d
+    hot_window_hours_open_interest: int = 168
+    hot_window_hours_orderbook: int = 24
+    hot_window_hours_liquidations: int = 720
+
+    # Vultr Object Storage (S3-compatible). Tokyo primary, Singapore mirror.
+    objectstore_endpoint: str | None = None
+    objectstore_region: str = "jp-tyo"
+    objectstore_access_key: SecretStr | None = None
+    objectstore_secret_key: SecretStr | None = None
+    bucket_archive: str = "botmaximus-archive-tokyo"
+    bucket_quarantine: str = "botmaximus-quarantine-tokyo"
+    bucket_mirror: str = "botmaximus-mirror-singapore"
+    #: Local staging/backend root. Used when no object-store endpoint is
+    #: configured — a single-box deployment writing to the attached volume.
+    archive_local_root: str = "data/archive"
+
+    # Vultr host. The 256GB block volume holds the Postgres data directory and
+    # archive staging; §1.A requires it encrypted and separate from the VPS root.
+    vultr_region: str = "nrt"                # Tokyo
+    vultr_block_mount: str = "/mnt/blockstore"
 
     # ---- instrument & venue ----
     # The venue the collectors read AND the venue orders would reach. These must

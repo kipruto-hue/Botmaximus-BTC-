@@ -12,23 +12,26 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
-KILL_STATE_COLLECTION = "risk_state"
 KILL_DOC_ID = "kill_stack"
 
 L3_RESET_TOKEN = "CONFIRM-RESET-L3"   # must be typed by the operator, never automated
 
 
 class KillStack:
-    def __init__(self, db) -> None:
-        self._db = db
+    def __init__(self, db=None) -> None:
+        # `db` is accepted and ignored so existing call sites and tests keep
+        # working through the storage migration. State lives in Postgres now.
         self.l1_suspended: dict[str, str] = {}   # strategy_id → reason
         self.l2_halted: str | None = None        # reason, or None
         self.l3_killed: str | None = None        # reason, or None
 
     # ---- persistence ----
     async def load(self) -> None:
-        doc = await self._db[KILL_STATE_COLLECTION].find_one({"_id": KILL_DOC_ID})
-        if doc:
+        from botmaximus.storage import postgres
+        row = await postgres.fetchrow(
+            "SELECT state FROM risk_state WHERE id = %s", (KILL_DOC_ID,))
+        if row:
+            doc = row["state"]
             self.l1_suspended = doc.get("l1_suspended", {})
             self.l2_halted = doc.get("l2_halted")
             self.l3_killed = doc.get("l3_killed")
@@ -36,17 +39,20 @@ class KillStack:
                 log.critical("L3 MASTER KILL is armed from persisted state: %s", self.l3_killed)
 
     async def _persist(self) -> None:
-        await self._db[KILL_STATE_COLLECTION].replace_one(
-            {"_id": KILL_DOC_ID},
-            {
-                "_id": KILL_DOC_ID,
+        import json
+
+        from botmaximus.storage import postgres
+        await postgres.execute(
+            "INSERT INTO risk_state (id, state, updated_at) "
+            "VALUES (%s, %s, now()) "
+            "ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, "
+            "  updated_at = now()",
+            (KILL_DOC_ID, json.dumps({
                 "l1_suspended": self.l1_suspended,
                 "l2_halted": self.l2_halted,
                 "l3_killed": self.l3_killed,
-                "updated_at": datetime.now(timezone.utc),
-            },
-            upsert=True,
-        )
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })))
 
     # ---- triggers (lowering is always allowed; raising never happens here) ----
     async def suspend_strategy(self, strategy_id: str, reason: str) -> None:

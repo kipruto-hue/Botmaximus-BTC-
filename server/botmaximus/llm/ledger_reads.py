@@ -42,10 +42,13 @@ class PopulationSummary:
     gaps: list[str]
 
 
-async def population_summary(db) -> PopulationSummary:
-    rows = [d async for d in db["strategies"].find(
-        {"lifecycle_state": {"$in": ["paper", "live", "candidate"]}},
-        {"_id": 0, "definition": 1, "lifecycle_state": 1, "signature": 1})]
+async def population_summary(db=None) -> PopulationSummary:
+    from botmaximus.storage import postgres
+    rows = await postgres.fetch(
+        "SELECT b.definition, s.lifecycle_state, s.signature FROM strategies s "
+        "LEFT JOIN strategy_definitions_blob b USING (definition_hash) "
+        "WHERE s.lifecycle_state = ANY(%s)",
+        (["paper", "live", "candidate"],))
 
     by_regime: dict[str, int] = {}
     by_family: dict[str, int] = {}
@@ -74,10 +77,11 @@ async def recent_failure_kinds(db, limit: int = 50) -> list[str]:
     failing and steers away. It cannot tune toward a threshold, because the
     numbers never leave this function.
     """
-    rows = [d async for d in db["backtest_runs"].find(
-        {"verdict.passed": False}, {"_id": 0, "verdict": 1}
-    ).sort("created_at", -1).limit(limit)]
-    reasons = [r for row in rows for r in (row.get("verdict") or {}).get("reasons", [])]
+    from botmaximus.storage import postgres
+    rows = await postgres.fetch(
+        "SELECT reasons FROM backtest_runs WHERE NOT passed "
+        "ORDER BY created_at DESC LIMIT %s", (limit,))
+    reasons = [r for row in rows for r in (row["reasons"] or [])]
     return coarsen(reasons)
 
 
@@ -86,13 +90,13 @@ async def recent_acceptance_signatures(db, limit: int = 10) -> list[str]:
 
     A signature says "this shape worked"; a definition is a template to copy.
     """
-    rows = [d async for d in db["strategies"].find(
-        {"lifecycle_state": {"$in": ["paper", "live"]}},
-        {"_id": 0, "signature": 1}
-    ).sort("updated_at", -1).limit(limit)]
+    from botmaximus.storage import postgres
+    rows = await postgres.fetch(
+        "SELECT signature FROM strategies WHERE lifecycle_state = ANY(%s) "
+        "ORDER BY updated_at DESC LIMIT %s", (["paper", "live"], limit))
     out = []
     for r in rows:
-        sig = sorted(r.get("signature") or [])
+        sig = sorted(r["signature"] or [])
         out.append("+".join(t for t in sig if t.startswith(("f:", "dir:"))))
     return [s for s in out if s]
 
@@ -106,12 +110,15 @@ async def coverage_summary(db, feeds: list[str]) -> dict[str, str]:
     """
     out: dict[str, str] = {}
     for feed in feeds:
-        oldest = await db["coverage"].find_one({"feed": feed}, sort=[("slot", 1)])
-        newest = await db["coverage"].find_one({"feed": feed}, sort=[("slot", -1)])
-        if not oldest or not newest:
+        from botmaximus.storage import postgres
+        row = await postgres.fetchrow(
+            "SELECT min(slot) AS oldest, max(slot) AS newest "
+            "FROM coverage_ledger WHERE feed = %s AND state = 'complete'",
+            (feed,))
+        if not row or not row["oldest"] or not row["newest"]:
             out[feed] = "none"
             continue
-        days = (newest["slot"] - oldest["slot"]).days
+        days = (row["newest"] - row["oldest"]).days
         out[feed] = ("years" if days > 365 else "months" if days > 60
                      else "weeks" if days > 14 else "days")
     return out
@@ -126,13 +133,14 @@ async def scrutiny_outcome_digest(db, window: int = 100) -> dict:
 
     Counts and rates only — no per-trade P&L reaches the prompt.
     """
-    rows = [d async for d in db["scrutiny_events"].find(
-        {"realized_known": True}, {"_id": 0, "verdict": 1, "realized_adverse": 1}
-    ).sort("at", -1).limit(window)]
-    approves = [r for r in rows if r.get("verdict") == "APPROVE"]
-    vetoes = [r for r in rows if r.get("verdict") == "VETO"]
-    bad_approves = sum(1 for r in approves if r.get("realized_adverse"))
-    good_vetoes = sum(1 for r in vetoes if r.get("realized_adverse"))
+    from botmaximus.storage import postgres
+    rows = await postgres.fetch(
+        "SELECT verdict, realized_adverse FROM scrutiny_events "
+        "WHERE realized_known ORDER BY at DESC LIMIT %s", (window,))
+    approves = [r for r in rows if r["verdict"] == "APPROVE"]
+    vetoes = [r for r in rows if r["verdict"] == "VETO"]
+    bad_approves = sum(1 for r in approves if r["realized_adverse"])
+    good_vetoes = sum(1 for r in vetoes if r["realized_adverse"])
     return {
         "sample": len(rows),
         "approvals": len(approves),

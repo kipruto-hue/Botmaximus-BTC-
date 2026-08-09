@@ -50,12 +50,11 @@ class _RestHistoryCollector:
         self.gather_q = gather_q
 
     async def _last_stored_ms(self) -> int | None:
-        from botmaximus.db.mongo import get_db
-        from botmaximus.db.schema import DATASET_COLLECTIONS
-        doc = await get_db()[DATASET_COLLECTIONS[self.dataset_id]].find_one(
-            {}, sort=[("event_time", -1)], projection={"event_time": 1}
-        )
-        return int(doc["event_time"].timestamp() * 1000) if doc else None
+        from botmaximus.config import settings
+        from botmaximus.storage import records as store
+        newest = await store.last_event_time(self.dataset_id,
+                                             venue=settings.venue)
+        return int(newest.timestamp() * 1000) if newest else None
 
     async def _fetch_page(self, client: httpx.AsyncClient, start_ms: int, end_ms: int) -> list:
         raise NotImplementedError

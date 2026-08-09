@@ -122,6 +122,17 @@ class Record:
     quality_ok: bool = False
     quality_gate_version: int = 1
 
+    #: Advisory annotations that do NOT mean the record failed (§10 additive
+    #: field). The collector's gate marks passing records with things like
+    #: `single_source`, `illiquid_window` and `backfill` — `single_source` on
+    #: literally every record. Putting those in `quality_flags` would make
+    #: "clean" and "flagged" the same state and, given the DB CHECK, would
+    #: quarantine the entire feed. They are still worth keeping: "this bar
+    #: passed, and it came from one venue during an illiquid window" is exactly
+    #: the context a post-incident review wants. So they live here, where they
+    #: cannot be mistaken for a failing check.
+    annotations: tuple[str, ...] = ()
+
     stage_latency_ms: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -133,12 +144,13 @@ class Record:
                     f"{name} is naive. Every timestamp is UTC-aware: a naive "
                     f"datetime means something different on the Tokyo VPS than "
                     f"on this desktop, and the difference is invisible.")
-        for flag in self.quality_flags:
-            if any(c.isdigit() or c in "<>" for c in str(flag)):
-                raise EnvelopeError(
-                    f"quality_flags carries a margin ({flag!r}). Check NAMES "
-                    f"only — a margin is a gradient, and these records reach "
-                    f"generator digests.")
+        for field_name in ("quality_flags", "annotations"):
+            for flag in getattr(self, field_name):
+                if any(c.isdigit() or c in "<>" for c in str(flag)):
+                    raise EnvelopeError(
+                        f"{field_name} carries a margin ({flag!r}). Check "
+                        f"NAMES only — a margin is a gradient, and these "
+                        f"records reach generator digests.")
         if self.quality_ok and self.quality_flags:
             raise EnvelopeError(
                 "quality_ok is True but quality_flags is non-empty. A record "
@@ -185,6 +197,7 @@ class Record:
     def to_row(self) -> dict:
         d = asdict(self)
         d["quality_flags"] = list(self.quality_flags)
+        d["annotations"] = list(self.annotations)
         return d
 
     def payload_hash(self) -> str:

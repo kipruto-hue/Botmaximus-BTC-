@@ -162,60 +162,99 @@ def reconcile(pred: Prediction, real: Realization) -> Drift:
 # store
 # =====================================================================
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[LEDGER].create_index([("trade_id", 1), ("leg", 1)], unique=True)
-    await db[LEDGER].create_index([("status", 1)])
-    await db[LEDGER].create_index([("strategy_id", 1), ("decision_time", -1)])
+    """No-op: keys and indexes are part of `schema.sql`."""
+    return None
 
 
 async def record_prediction(pred: Prediction) -> None:
-    """Written before the order goes out. If the process dies between this and
-    the fill, the leg is left `pending` — which is the honest state, and shows
-    up in the report as an unreconciled leg rather than vanishing."""
-    from botmaximus.db.mongo import get_db
-    await get_db()[LEDGER].update_one(
-        {"trade_id": pred.trade_id, "leg": pred.leg},
-        {"$setOnInsert": pred.to_doc()},
-        upsert=True,
-    )
+    """Written before the order goes out.
+
+    If the process dies between this and the fill, the leg has a prediction and
+    no realization — which the view reports as `pending`. That is the honest
+    state, and it shows up as an unreconciled leg rather than vanishing.
+    """
+    from botmaximus.storage import postgres
+    await postgres.execute(
+        "INSERT INTO execution_ledger_predictions "
+        "(trade_id, leg, strategy_id, direction, symbol, qty, decision_time, "
+        " reference_price, predicted_fill, predicted_fee, "
+        " predicted_slippage_bps, predicted_latency_ms, predicted_funding) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (trade_id, leg) DO NOTHING",
+        (pred.trade_id, pred.leg, pred.strategy_id, pred.direction, pred.symbol,
+         pred.qty, pred.decision_time, pred.reference_price,
+         pred.predicted_fill, pred.predicted_fee, pred.predicted_slippage_bps,
+         pred.predicted_latency_ms, pred.predicted_funding))
 
 
 async def record_realization(real: Realization) -> Drift | None:
-    """Attach the venue's answer and reconcile. Returns None if no prediction
-    was recorded — which is itself a defect worth seeing, not a reason to
-    silently create one: a fill with no prediction means an order was placed
-    outside the path that is supposed to record intent."""
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    doc = await db[LEDGER].find_one({"trade_id": real.trade_id, "leg": real.leg})
+    """Attach the venue's answer and reconcile.
+
+    Returns None if no prediction was recorded — itself a defect worth seeing,
+    not a reason to silently create one: a fill with no prediction means an
+    order was placed outside the path that is supposed to record intent. The
+    foreign key enforces the same thing at the database, so this cannot be
+    bypassed by a different caller.
+
+    The realization and its drift are written in one transaction: a reconciled
+    leg with no drift row would read as calibrated rather than as half-written.
+    """
+    from botmaximus.storage import postgres
+    doc = await postgres.fetchrow(
+        "SELECT * FROM execution_ledger_predictions "
+        "WHERE trade_id = %s AND leg = %s", (real.trade_id, real.leg))
     if doc is None:
         return None
 
-    pred = Prediction(**{k: doc[k] for k in Prediction.__dataclass_fields__})
+    pred = Prediction(**{k: _num(doc[k])
+                         for k in Prediction.__dataclass_fields__})
     drift = reconcile(pred, real)
-    await db[LEDGER].update_one(
-        {"trade_id": real.trade_id, "leg": real.leg},
-        {"$set": {
-            "status": RECONCILED,
-            "realized": {k: v for k, v in asdict(real).items()
-                         if k not in ("trade_id", "leg")},
-            "drift": asdict(drift),
-            "reconciled_at": datetime.now(timezone.utc),
-        }},
-    )
+    async with postgres.transaction() as conn:
+        await conn.execute(
+            "INSERT INTO execution_ledger_realizations "
+            "(trade_id, leg, status, realized_fill, realized_fee, "
+            " realized_funding, realized_latency_ms) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (trade_id, leg) DO NOTHING",
+            (real.trade_id, real.leg, RECONCILED, real.realized_fill,
+             real.realized_fee, real.realized_funding,
+             (real.fill_time - pred.decision_time).total_seconds() * 1000))
+        d = asdict(drift)
+        await conn.execute(
+            "INSERT INTO execution_ledger_drift "
+            "(trade_id, leg, strategy_id, slippage_bps_predicted, "
+            " slippage_bps_realized, slippage_bps_drift, fee_drift, "
+            " latency_ms_drift, qty_shortfall, funding_drift, cost_drift_usd, "
+            " partial) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (trade_id, leg) DO NOTHING",
+            (d["trade_id"], d["leg"], d["strategy_id"],
+             d["slippage_bps_predicted"], d["slippage_bps_realized"],
+             d["slippage_bps_drift"], d["fee_drift"], d["latency_ms_drift"],
+             d["qty_shortfall"], d["funding_drift"], d["cost_drift_usd"],
+             d["partial"]))
     return drift
 
 
 async def mark_unfilled(trade_id: str, leg: str, reason: str) -> None:
     """A cancelled or rejected order. Distinct from `pending` on purpose: one is
     a known outcome, the other is an open question."""
-    from botmaximus.db.mongo import get_db
-    await get_db()[LEDGER].update_one(
-        {"trade_id": trade_id, "leg": leg},
-        {"$set": {"status": UNFILLED, "unfilled_reason": reason,
-                  "closed_at": datetime.now(timezone.utc)}},
-    )
+    from botmaximus.storage import postgres
+    await postgres.execute(
+        "INSERT INTO execution_ledger_realizations "
+        "(trade_id, leg, status, unfilled_reason) VALUES (%s,%s,%s,%s) "
+        "ON CONFLICT (trade_id, leg) DO UPDATE SET "
+        "  status = EXCLUDED.status, unfilled_reason = EXCLUDED.unfilled_reason",
+        (trade_id, leg, UNFILLED, reason))
+
+
+def _num(v):
+    """Postgres `numeric` arrives as Decimal; the cost arithmetic is float.
+
+    Mixing them raises `unsupported operand type(s) for -: 'decimal.Decimal'
+    and 'float'` deep inside `reconcile`, far from the column that caused it.
+    """
+    from decimal import Decimal
+    return float(v) if isinstance(v, Decimal) else v
 
 
 # =====================================================================
@@ -236,10 +275,14 @@ async def calibration(strategy_id: str | None = None, limit: int = 5000) -> dict
     healthy one: with no realized fills every mean is 0.0, which is exactly what
     a perfectly calibrated model looks like. The two are opposite conclusions.
     """
-    from botmaximus.db.mongo import get_db
-    q: dict = {} if strategy_id is None else {"strategy_id": strategy_id}
-    cursor = get_db()[LEDGER].find(q, {"_id": 0}).sort("decision_time", -1).limit(limit)
-    docs = [d async for d in cursor]
+    from botmaximus.storage import postgres
+    sql = "SELECT * FROM execution_ledger "
+    params: tuple = (limit,)
+    if strategy_id is not None:
+        sql += "WHERE strategy_id = %s "
+        params = (strategy_id, limit)
+    sql += "ORDER BY decision_time DESC LIMIT %s"
+    docs = await postgres.fetch(sql, params)
 
     pending = [d for d in docs if d.get("status") == PENDING]
     unfilled = [d for d in docs if d.get("status") == UNFILLED]

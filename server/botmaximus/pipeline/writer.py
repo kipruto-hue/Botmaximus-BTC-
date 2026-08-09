@@ -1,8 +1,35 @@
-"""Store stage: route envelopes to their collections; quarantine hard failures.
+r"""Store stage: hand every envelope to the two-store write path.
 
-Time-series collections are insert-only, so duplicate protection (e.g. a
-reconnect replaying the last closed candle) is done here by tracking the
-newest stored event_time per dataset, seeded from the DB at startup.
+The routing decision — clean to Postgres + Parquet, failed to quarantine — lives
+in `storage/records.py` and is deliberately not repeated here. This module keeps
+what is genuinely the writer's job: **not writing the same record twice**, and
+reporting store latency to telemetry.
+
+## Dedupe, and why there are still two strategies
+
+Postgres has a real primary key now, so `ON CONFLICT (record_id, event_time) DO
+NOTHING` is the backstop. But `record_id` is minted fresh per envelope, so two
+observations of the same candle get two ids and the constraint would not catch
+them. The in-memory watermark is what actually prevents that, exactly as it did
+under Mongo:
+
+- **Live records** arrive in order, so anything at or behind the newest stored
+  `event_time` for that dataset is a replay (a reconnect re-sending the last
+  closed candle) and is dropped without touching the database.
+- **Backfilled records** fill holes *behind* the watermark by definition, so the
+  monotonic test cannot apply and existence is checked against the store.
+
+Dropping the watermark and relying on the constraint alone would silently
+double-count every reconnect, and the coverage ledger and integrity checks are
+both derived from these counts.
+
+## Store latency
+
+Under Mongo a time-series document was immutable, so a record could not carry
+its own write duration and each one carried the *previous* write's latency for
+its dataset. That constraint is gone — the row is built before it is sent — so
+each record now carries its own measured store latency. Telemetry keeps exact
+per-record timing either way; this only changes what is stamped in the record.
 """
 from __future__ import annotations
 
@@ -10,10 +37,11 @@ import logging
 import time
 from datetime import datetime
 
-from botmaximus.db.mongo import get_db
-from botmaximus.db.schema import DATASET_COLLECTIONS, QUARANTINE
+from botmaximus.db.schema import DATASETS
 from botmaximus.pipeline.envelope import Envelope
 from botmaximus.pipeline.telemetry import telemetry
+from botmaximus.storage import records as store
+from botmaximus.storage.venues import venue_of
 
 log = logging.getLogger(__name__)
 
@@ -21,60 +49,56 @@ log = logging.getLogger(__name__)
 class Writer:
     def __init__(self) -> None:
         self._last_written: dict[str, datetime] = {}
-        self._last_store_ms: dict[str, float] = {}
 
     async def seed_dedupe(self) -> None:
-        db = get_db()
-        for dataset_id, coll in DATASET_COLLECTIONS.items():
-            doc = await db[coll].find_one(
-                {"meta.dataset_id": dataset_id}, sort=[("event_time", -1)]
-            )
-            if doc:
-                self._last_written[dataset_id] = doc["event_time"]
+        """Rebuild the watermark from the store at startup (§3.C).
+
+        In-memory state is a working buffer, never the record of truth, so on
+        restart it is rebuilt from what was actually committed rather than
+        assumed empty — otherwise the first reconnect after every restart
+        re-stores candles the system already has.
+        """
+        for dataset_id in DATASETS:
+            newest = await store.last_event_time(
+                dataset_id, venue=venue_of(_source_for(dataset_id)))
+            if newest is not None:
+                self._last_written[dataset_id] = newest
 
     async def write(self, env: Envelope) -> None:
-        db = get_db()
+        if not env.quarantine_reasons and env.quality_ok:
+            last = self._last_written.get(env.dataset_id)
+            if env.backfill:
+                # Backfill lands behind the watermark, so the monotonic test
+                # cannot apply. `ON CONFLICT DO NOTHING` in the write path is
+                # what makes a re-offered historical record a no-op.
+                pass
+            elif last is not None and env.event_time <= last:
+                return          # replay of an already-stored record
 
-        if env.quarantine_reasons:
-            doc = env.to_doc()
-            doc["quarantine_reasons"] = env.quarantine_reasons
-            await db[QUARANTINE].insert_one(doc)
+        t0 = time.perf_counter()
+        rec = env.to_record()
+        result = await store.write_records([rec])
+        env.stage_latency_ms["store"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        if result.quarantined:
             telemetry.record_quarantined()
-            log.warning("quarantined %s: %s", env.dataset_id, env.quarantine_reasons)
+            log.warning("quarantined %s: %s", env.dataset_id,
+                        env.quarantine_reasons or env.quality_flags)
             return
 
-        coll = DATASET_COLLECTIONS[env.dataset_id]
         last = self._last_written.get(env.dataset_id)
-        if env.backfill:
-            # backfill fills holes *behind* the newest record, so the monotonic
-            # check can't apply — dedupe against the DB directly (rare, cheap)
-            exists = await db[coll].find_one(
-                {"meta.dataset_id": env.dataset_id, "event_time": env.event_time}
-            )
-            if exists:
-                return
-        elif last is not None and env.event_time <= last:
-            return  # duplicate/replay — already stored
-
-        # A record's own write duration can't be embedded in itself (time-series
-        # docs are immutable), so each doc carries the previous write's measured
-        # latency for its dataset; telemetry gets exact per-record timing in bus.py.
-        env.stage_latency_ms["store"] = self._last_store_ms.get(env.dataset_id, 0.0)
-        t0 = time.perf_counter()
-        await db[coll].insert_one(env.to_doc())
-        self._last_store_ms[env.dataset_id] = round((time.perf_counter() - t0) * 1000, 2)
         if last is None or env.event_time > last:
             self._last_written[env.dataset_id] = env.event_time
-        telemetry.record_stored(env.dataset_id, env.ingest_time, env.event_time, backfill=env.backfill)
+        telemetry.record_stored(env.dataset_id, env.ingest_time, env.event_time,
+                                backfill=env.backfill)
 
     async def write_many(self, envs: list[Envelope]) -> int:
-        """Batch store for deep historical backfill — same storage authority as
-        `write`, but one existence query and one insert per batch instead of per
-        record. The per-record path's find_one dedupe is fine for healing a
-        handful of gaps; at 10^6 candles it would be 2M round-trips.
+        """Batch store for deep historical backfill.
 
-        Backfill-only by contract: live records must keep the monotonic dedupe
-        and per-record timing in `write`.
+        Same storage authority as `write`, one round-trip per batch instead of
+        per record — at 10^6 candles the per-record path would be millions of
+        round-trips. Backfill-only by contract: live records keep the monotonic
+        dedupe and per-record timing above.
         """
         if not envs:
             return 0
@@ -82,55 +106,54 @@ class Writer:
             raise ValueError("write_many is backfill-only (§5.1)")
         datasets = {e.dataset_id for e in envs}
         if len(datasets) != 1:
-            raise ValueError(f"write_many takes one dataset at a time, got {datasets}")
-
-        db = get_db()
+            raise ValueError(
+                f"write_many takes one dataset at a time, got {datasets}")
         dataset_id = envs[0].dataset_id
 
-        quarantined = [e for e in envs if e.quarantine_reasons]
-        if quarantined:
-            docs = []
-            for e in quarantined:
-                d = e.to_doc()
-                d["quarantine_reasons"] = e.quarantine_reasons
-                docs.append(d)
-            await db[QUARANTINE].insert_many(docs)
-            for _ in docs:
-                telemetry.record_quarantined()
-            log.warning("quarantined %d %s records", len(docs), dataset_id)
-
-        clean = [e for e in envs if not e.quarantine_reasons]
-        if not clean:
-            return 0
-
-        coll = DATASET_COLLECTIONS[dataset_id]
-        lo = min(e.event_time for e in clean)
-        hi = max(e.event_time for e in clean)
-        cursor = db[coll].find(
-            {"meta.dataset_id": dataset_id, "event_time": {"$gte": lo, "$lte": hi}},
-            {"event_time": 1},
-        )
-        existing = {d["event_time"] async for d in cursor}
-
-        fresh, seen = [], set()
-        for e in clean:
-            if e.event_time in existing or e.event_time in seen:
-                continue        # already stored, or duplicated within this batch
+        # Within-batch duplicates would each get their own record_id and so
+        # survive the primary key; collapse them on event_time first.
+        seen: set[datetime] = set()
+        deduped: list[Envelope] = []
+        for e in envs:
+            if e.event_time in seen:
+                continue
             seen.add(e.event_time)
-            e.stage_latency_ms["store"] = self._last_store_ms.get(dataset_id, 0.0)
-            fresh.append(e)
-        if not fresh:
-            return 0
+            deduped.append(e)
 
         t0 = time.perf_counter()
-        await db[coll].insert_many([e.to_doc() for e in fresh])
+        result = await store.write_records([e.to_record() for e in deduped])
         elapsed = (time.perf_counter() - t0) * 1000
-        self._last_store_ms[dataset_id] = round(elapsed / len(fresh), 2)
 
-        newest = max(e.event_time for e in fresh)
-        last = self._last_written.get(dataset_id)
-        if last is None or newest > last:
-            self._last_written[dataset_id] = newest
-        for e in fresh:
-            telemetry.record_stored(dataset_id, e.ingest_time, e.event_time, backfill=True)
-        return len(fresh)
+        if result.quarantined:
+            for _ in range(result.quarantined):
+                telemetry.record_quarantined()
+            log.warning("quarantined %d %s records", result.quarantined,
+                        dataset_id)
+        if not result.written:
+            return 0
+
+        per_record = round(elapsed / max(len(deduped), 1), 2)
+        clean = [e for e in deduped
+                 if not e.quarantine_reasons and e.quality_ok]
+        for e in clean:
+            e.stage_latency_ms["store"] = per_record
+            telemetry.record_stored(dataset_id, e.ingest_time, e.event_time,
+                                    backfill=True)
+
+        if clean:
+            newest = max(e.event_time for e in clean)
+            last = self._last_written.get(dataset_id)
+            if last is None or newest > last:
+                self._last_written[dataset_id] = newest
+        return result.written
+
+
+def _source_for(dataset_id: str) -> str:
+    """The venue a dataset's records belong to.
+
+    Reads from `settings.venue` rather than from a record, because at seed time
+    there is no record yet — this is the question "which venue am I collecting
+    for right now", which is exactly what config answers.
+    """
+    from botmaximus.config import settings
+    return settings.venue

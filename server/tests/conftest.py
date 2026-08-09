@@ -13,11 +13,16 @@ assumption shows up as a failing test instead of a surprise in production.
 """
 from __future__ import annotations
 
-import pytest
+import os
 
+import pytest
+import pytest_asyncio
+
+from botmaximus.config import settings
 from botmaximus.execution import venue
 from botmaximus.execution.venue import RiskTier, VenueConstants
 from botmaximus.obs import degradation
+from botmaximus.storage import postgres
 
 #: Bybit BTCUSDT LinearPerpetual, captured live 2026-08-05.
 BYBIT_BTCUSDT = VenueConstants(
@@ -57,3 +62,82 @@ def clean_degradation_counters():
     degradation.reset_for_tests()
     yield
     degradation.reset_for_tests()
+
+
+# ---------------------------------------------------------------- Postgres
+#: Opt-in, via env var, and never the production DSN by default.
+#:
+#: These tests TRUNCATE every table between cases. Defaulting to
+#: `settings.postgres_dsn` would make "ran the test suite with .env loaded"
+#: indistinguishable from "wiped the live decision record", so the DSN has to
+#: be named explicitly and the suite skips when it is not.
+TEST_DSN_ENV = "BOTMAXIMUS_TEST_POSTGRES_DSN"
+
+# Windows default loop is one psycopg cannot use; without this every
+# Postgres-backed test skips with what looks like an unreachable database.
+postgres.ensure_compatible_event_loop()
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    """pytest-asyncio builds each test's loop from this policy."""
+    postgres.ensure_compatible_event_loop()
+    import asyncio
+    return asyncio.get_event_loop_policy()
+
+
+@pytest.fixture
+def pg_dsn() -> str:
+    dsn = os.environ.get(TEST_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"set {TEST_DSN_ENV} to run the Postgres-backed tests")
+    return dsn
+
+
+@pytest_asyncio.fixture
+async def pg(pg_dsn, monkeypatch):
+    """A bootstrapped, empty `bmx` schema on the test database.
+
+    Function-scoped on purpose: `AsyncConnectionPool` binds to the event loop
+    it was opened in, and pytest-asyncio gives each test its own loop. A
+    session-scoped pool would work for exactly one test and then fail in ways
+    that look like database errors rather than fixture errors.
+    """
+    monkeypatch.setattr(settings, "postgres_dsn", pg_dsn)
+    postgres.reset_for_tests()
+    try:
+        await postgres.open_pool()
+    except postgres.PostgresUnavailable as e:
+        postgres.reset_for_tests()
+        pytest.skip(f"postgres not reachable at {TEST_DSN_ENV}: {e}")
+    await postgres.bootstrap()
+    await _truncate_all()
+    try:
+        yield postgres
+    finally:
+        await postgres.close()
+        postgres.reset_for_tests()
+
+
+async def _truncate_all() -> None:
+    """Empty every table, including the market_records partitions.
+
+    TRUNCATE on the partitioned parent cascades to its partitions but leaves
+    them attached, so a test that created yesterday's partition does not leak
+    rows into the next test while still exercising real partition routing.
+    """
+    rows = await postgres.fetch(
+        "SELECT tablename FROM pg_tables WHERE schemaname = %s",
+        (postgres.SCHEMA,))
+    # `schema_version` is not test data — it records which DDL this database
+    # was brought up to (§10). Truncating it would make bootstrap look like it
+    # never ran, which is the difference between "empty database" and
+    # "unmigrated database".
+    names = [r["tablename"] for r in rows
+             if not r["tablename"].startswith("market_records_")
+             and r["tablename"] != "schema_version"]
+    if not names:
+        return
+    async with postgres.connection() as conn:
+        await conn.execute(
+            f"TRUNCATE {', '.join(names)} RESTART IDENTITY CASCADE")

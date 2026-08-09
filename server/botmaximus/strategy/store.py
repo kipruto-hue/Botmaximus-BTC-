@@ -22,11 +22,15 @@ STRATEGY_EVENTS = "strategy_events"
 
 
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[STRATEGIES].create_index([("strategy_id", 1)], unique=True)
-    await db[STRATEGIES].create_index([("lifecycle_state", 1)])
-    await db[STRATEGY_EVENTS].create_index([("strategy_id", 1), ("at", -1)])
+    """No-op: keys and indexes are part of `schema.sql`."""
+    return None
+
+
+def _definition_hash(defn: StrategyDefinition) -> str:
+    import hashlib
+    import json
+    blob = json.dumps(defn.to_dict(), sort_keys=True, default=str).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
 
 
 def build_doc(defn: StrategyDefinition, warnings: list[str] | None = None) -> dict:
@@ -55,49 +59,97 @@ async def upsert(defn: StrategyDefinition, warnings: list[str] | None = None) ->
     verdict: overwriting it with None here would erase the gate result that the
     dashboard reads and that Pass C2's generator learns from.
     """
-    from botmaximus.db.mongo import get_db
-    doc = build_doc(defn, warnings)
-    insert_only = {k: doc.pop(k) for k in
-                   ("lifecycle_state", "created_at", "last_verdict")}
-    await get_db()[STRATEGIES].update_one(
-        {"strategy_id": defn.id},
-        {"$set": doc, "$setOnInsert": insert_only},
-        upsert=True,
-    )
+    import json
+
+    from botmaximus.storage import postgres
+    defn_hash = _definition_hash(defn)
+    async with postgres.transaction() as conn:
+        # The definition is content-addressed and immutable: the same hash
+        # across a backtest and a live run is what proves compilation was
+        # deterministic (§3.E).
+        await conn.execute(
+            "INSERT INTO strategy_definitions_blob (definition_hash, definition) "
+            "VALUES (%s, %s) ON CONFLICT (definition_hash) DO NOTHING",
+            (defn_hash, json.dumps(defn.to_dict(), default=str)))
+        # DO UPDATE touches only the mutable columns. `lifecycle_state` is
+        # absent deliberately — only `record_transition` may move it, otherwise
+        # re-registering would silently resurrect a retired strategy. So are
+        # `created_at` (the original registration) and `last_verdict`
+        # (re-registration is not a new verdict).
+        await conn.execute(
+            "INSERT INTO strategies (strategy_id, version, definition_hash, "
+            "  lifecycle_state, origin, rationale, signature, warnings) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (strategy_id, version) DO UPDATE SET "
+            "  definition_hash = EXCLUDED.definition_hash, "
+            "  origin = EXCLUDED.origin, rationale = EXCLUDED.rationale, "
+            "  signature = EXCLUDED.signature, warnings = EXCLUDED.warnings, "
+            "  updated_at = now()",
+            (defn.id, defn.version, defn_hash, defn.lifecycle_state,
+             defn.origin, defn.rationale, sorted(signature(defn)),
+             warnings or []))
 
 
 async def record_transition(t: Transition) -> None:
-    """Append the event *and* move the state — one call, so an audit log entry
-    without a corresponding state change (or the reverse) is not possible."""
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[STRATEGY_EVENTS].insert_one(t.to_doc())
-    update = {"lifecycle_state": t.to_state, "updated_at": t.at}
-    if t.verdict is not None:
-        update["last_verdict"] = t.verdict
-    await db[STRATEGIES].update_one({"strategy_id": t.strategy_id}, {"$set": update})
+    """Append the event *and* move the state — one transaction, so an audit log
+    entry without a corresponding state change (or the reverse) is not
+    possible."""
+    import json
+
+    from botmaximus.storage import postgres
+    async with postgres.transaction() as conn:
+        await conn.execute(
+            "INSERT INTO strategy_lifecycle_events "
+            "(strategy_id, version, from_state, to_state, reason, actor, "
+            " verdict, at) "
+            "SELECT %s, s.version, %s, %s, %s, %s, %s, %s FROM strategies s "
+            "WHERE s.strategy_id = %s "
+            "ORDER BY s.version DESC LIMIT 1",
+            (t.strategy_id, t.from_state, t.to_state, t.reason, "auto",
+             json.dumps(t.verdict, default=str) if t.verdict else None,
+             t.at, t.strategy_id))
+        if t.verdict is not None:
+            await conn.execute(
+                "UPDATE strategies SET lifecycle_state = %s, updated_at = %s, "
+                "  last_verdict = %s WHERE strategy_id = %s",
+                (t.to_state, t.at, json.dumps(t.verdict, default=str),
+                 t.strategy_id))
+        else:
+            await conn.execute(
+                "UPDATE strategies SET lifecycle_state = %s, updated_at = %s "
+                "WHERE strategy_id = %s",
+                (t.to_state, t.at, t.strategy_id))
 
 
 async def record_verdict(strategy_id: str, verdict: dict) -> None:
-    from botmaximus.db.mongo import get_db
-    await get_db()[STRATEGIES].update_one(
-        {"strategy_id": strategy_id},
-        {"$set": {"last_verdict": verdict,
-                  "updated_at": datetime.now(timezone.utc)}},
-    )
+    import json
+
+    from botmaximus.storage import postgres
+    await postgres.execute(
+        "UPDATE strategies SET last_verdict = %s, updated_at = now() "
+        "WHERE strategy_id = %s",
+        (json.dumps(verdict, default=str), strategy_id))
 
 
 async def get(strategy_id: str) -> dict | None:
-    from botmaximus.db.mongo import get_db
-    return await get_db()[STRATEGIES].find_one({"strategy_id": strategy_id},
-                                               {"_id": 0})
+    from botmaximus.storage import postgres
+    return await postgres.fetchrow(
+        "SELECT s.*, b.definition FROM strategies s "
+        "LEFT JOIN strategy_definitions_blob b USING (definition_hash) "
+        "WHERE s.strategy_id = %s ORDER BY s.version DESC LIMIT 1",
+        (strategy_id,))
 
 
 async def list_population(states: list[str] | None = None) -> list[dict]:
-    from botmaximus.db.mongo import get_db
-    q = {"lifecycle_state": {"$in": states}} if states else {}
-    cursor = get_db()[STRATEGIES].find(q, {"_id": 0}).sort("created_at", 1)
-    return [d async for d in cursor]
+    from botmaximus.storage import postgres
+    sql = ("SELECT s.*, b.definition FROM strategies s "
+           "LEFT JOIN strategy_definitions_blob b USING (definition_hash) ")
+    params: tuple = ()
+    if states:
+        sql += "WHERE s.lifecycle_state = ANY(%s) "
+        params = (list(states),)
+    sql += "ORDER BY s.created_at"
+    return await postgres.fetch(sql, params)
 
 
 async def signatures_for_dedupe(exclude_retired: bool = True):
@@ -108,15 +160,16 @@ async def signatures_for_dedupe(exclude_retired: bool = True):
     it replaces — blocking it against its own retired ancestor would make the
     repair loop unable to ever produce anything.
     """
-    from botmaximus.db.mongo import get_db
-    q = {"lifecycle_state": {"$ne": "retired"}} if exclude_retired else {}
-    cursor = get_db()[STRATEGIES].find(q, {"_id": 0, "strategy_id": 1, "signature": 1})
-    return [(d["strategy_id"], frozenset(d.get("signature") or []))
-            async for d in cursor]
+    from botmaximus.storage import postgres
+    sql = "SELECT strategy_id, signature FROM strategies "
+    if exclude_retired:
+        sql += "WHERE lifecycle_state <> 'retired'"
+    rows = await postgres.fetch(sql)
+    return [(r["strategy_id"], frozenset(r["signature"] or [])) for r in rows]
 
 
 async def events(strategy_id: str, limit: int = 50) -> list[dict]:
-    from botmaximus.db.mongo import get_db
-    cursor = get_db()[STRATEGY_EVENTS].find(
-        {"strategy_id": strategy_id}, {"_id": 0}).sort("at", -1).limit(limit)
-    return [d async for d in cursor]
+    from botmaximus.storage import postgres
+    return await postgres.fetch(
+        "SELECT * FROM strategy_lifecycle_events WHERE strategy_id = %s "
+        "ORDER BY at DESC LIMIT %s", (strategy_id, limit))

@@ -12,17 +12,19 @@ import pytest
 from botmaximus.backtest.costs import CostModel
 from botmaximus.execution import ledger
 from botmaximus.execution.ledger import Prediction, Realization, reconcile
-from tests.test_gate_hardening import FakeDB   # noqa: F401  (shared fake mongo)
-
 T0 = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture
-def db(monkeypatch):
-    fake = FakeDB()
-    from botmaximus.db import mongo
-    monkeypatch.setattr(mongo, "get_db", lambda: fake)
-    return fake
+def db(pg):
+    """Kept under its old name so the tests below read unchanged; it is now a
+    real, empty Postgres schema rather than a fake collection.
+
+    Worth noting for these tests in particular: the three-table ledger enforces
+    with a foreign key what the fake could only be trusted to do — a
+    realization cannot exist without its prediction.
+    """
+    return pg
 
 
 def _pred(**kw) -> Prediction:
@@ -187,8 +189,10 @@ async def test_a_prediction_is_never_overwritten(db):
     after seeing the fill would drive drift to zero by construction."""
     await ledger.record_prediction(_pred(predicted_fill=100_010.0))
     await ledger.record_prediction(_pred(predicted_fill=999_999.0))
-    doc = await db[ledger.LEDGER].find_one({"trade_id": "t1", "leg": "entry"})
-    assert doc["predicted_fill"] == 100_010.0
+    doc = await db.fetchrow(
+        "SELECT * FROM execution_ledger_predictions "
+        "WHERE trade_id = %s AND leg = %s", ("t1", "entry"))
+    assert float(doc["predicted_fill"]) == 100_010.0
 
 
 @pytest.mark.asyncio

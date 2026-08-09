@@ -20,24 +20,28 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from botmaximus.db.mongo import get_db
+from botmaximus.config import settings
 from botmaximus.pipeline.telemetry import telemetry
+from botmaximus.storage import postgres
 
 log = logging.getLogger(__name__)
-
-COVERAGE_COLLECTION = "coverage"
 
 COMPLETE = "complete"
 PARTIAL = "partial"
 MISSING = "missing"
 
-# feed → the ws source (telemetry.ws_sources key) whose uptime defines its coverage
+# feed → the ws source (telemetry.ws_sources key) whose uptime defines its
+# coverage. Bybit serves every topic over ONE socket (`bybit-public`), where
+# Binance needed two because its futures streams are routed by path. That means
+# a single socket death now takes all three event-driven feeds with it — which
+# is worse operationally, and worth remembering when reading a coverage report
+# that shows three feeds failing at exactly the same second.
 EVENT_DRIVEN_FEEDS = {
-    "btc_price_tick": "binance",
-    "btc_liquidation": "binance-futures-market",
-    "btc_orderbook": "binance-futures-depth",
+    "btc_price_tick": "bybit-public",
+    "btc_liquidation": "bybit-public",
+    "btc_orderbook": "bybit-public",
 }
-# feed → collection, granularity in seconds (a stored record = coverage for that slot)
+# feed → dataset_id, granularity in seconds (a stored record = coverage for that slot)
 RECORD_BACKED_FEEDS = {
     "btc_ohlcv_1m": ("btc_ohlcv_1m", 60),
     "btc_funding_8h": ("btc_funding_8h", 8 * 3600),
@@ -60,106 +64,97 @@ def snap_slot(dt: datetime, granularity_s: int) -> datetime:
 
 
 async def ensure_indexes() -> None:
-    db = get_db()
-    await db[COVERAGE_COLLECTION].create_index(
-        [("feed", 1), ("slot", 1)], unique=True
-    )
-    await db[COVERAGE_COLLECTION].create_index([("feed", 1), ("state", 1)])
+    """No-op: the ledger's keys and indexes are declared in `schema.sql`.
+
+    Kept so boot sequences that call it do not need to know that the ledger
+    moved from a collection with runtime-created indexes to a table whose
+    primary key is part of its definition.
+    """
+    return None
 
 
-async def mark(feed: str, slot: datetime, state: str, source: str) -> None:
-    """Upsert one coverage slot. A `complete` mark never downgrades to missing."""
-    db = get_db()
-    existing = await db[COVERAGE_COLLECTION].find_one(
-        {"feed": feed, "slot": slot}, {"state": 1}
-    )
-    if existing and existing["state"] == COMPLETE and state != COMPLETE:
-        return
-    await db[COVERAGE_COLLECTION].replace_one(
-        {"feed": feed, "slot": slot},
-        {"feed": feed, "slot": slot, "state": state, "source": source,
-         "updated_at": datetime.now(timezone.utc)},
-        upsert=True,
-    )
+async def mark(feed: str, slot: datetime, state: str, source: str,
+               venue: str | None = None) -> None:
+    """Upsert one coverage slot. A `complete` mark never downgrades.
+
+    The guard is in the statement rather than in a read-then-write pair. The old
+    version fetched the row, decided, and wrote — a race in which the heartbeat
+    and a reconcile could interleave and lose a `complete`. Here the WHERE on
+    the DO UPDATE makes the downgrade impossible at the database, which is also
+    what makes the bulk path below safe to run without reading first.
+    """
+    await postgres.execute(
+        "INSERT INTO coverage_ledger (venue, feed, slot, state, source, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,now()) "
+        "ON CONFLICT (venue, feed, slot) DO UPDATE SET "
+        "  state = EXCLUDED.state, source = EXCLUDED.source, "
+        "  updated_at = now() "
+        "WHERE coverage_ledger.state <> 'complete' OR EXCLUDED.state = 'complete'",
+        (venue or settings.venue, feed, slot, state, source))
 
 
-async def reconcile_record_feed(feed: str, since: datetime | None = None) -> int:
+async def reconcile_record_feed(feed: str, since: datetime | None = None,
+                                venue: str | None = None) -> int:
     """Rebuild coverage for a record-backed feed from its stored records.
-    Returns the number of complete slots found."""
+
+    One statement: the slots are derived from `market_records` in the database
+    and inserted straight into the ledger, so two years of candles is a single
+    server-side pass rather than 10^6 round-trips. `snap_slot`'s grid is
+    reproduced by `to_timestamp(floor(extract(epoch …)))`, and a test asserts
+    the SQL and the Python agree — if those grids ever diverge, a 5-minute feed
+    snapped to :30 against a gap grid on :31 reports 100% missing.
+
+    Only ever writes COMPLETE, so it cannot downgrade a slot.
+    """
     if feed not in RECORD_BACKED_FEEDS:
         raise ValueError(f"{feed} is not record-backed")
-    coll_name, granularity_s = RECORD_BACKED_FEEDS[feed]
-    db = get_db()
-    query = {}
+    dataset_id, granularity_s = RECORD_BACKED_FEEDS[feed]
+    venue = venue or settings.venue
+
+    sql = (
+        "INSERT INTO coverage_ledger (venue, feed, slot, state, source, updated_at) "
+        "SELECT DISTINCT %s, %s, "
+        "       to_timestamp(floor(extract(epoch FROM event_time) / %s) * %s), "
+        "       'complete', 'record', now() "
+        "  FROM market_records "
+        " WHERE venue = %s AND dataset_id = %s AND valid_to_sys IS NULL ")
+    params: list = [venue, feed, granularity_s, granularity_s, venue, dataset_id]
     if since is not None:
-        query = {"event_time": {"$gte": since}}
-    cursor = db[coll_name].find(query, {"event_time": 1})
-    count = 0
-    async for doc in cursor:
-        await mark(feed, snap_slot(doc["event_time"], granularity_s), COMPLETE, "record")
-        count += 1
-    return count
+        sql += "   AND event_time >= %s "
+        params.append(since)
+    sql += ("ON CONFLICT (venue, feed, slot) DO UPDATE SET "
+            "  state = EXCLUDED.state, source = EXCLUDED.source, "
+            "  updated_at = now() "
+            "WHERE coverage_ledger.state <> 'complete'")
+    return await postgres.execute(sql, tuple(params))
 
 
 async def reconcile_record_feed_bulk(feed: str, since: datetime | None = None,
                                      batch: int = 50_000) -> int:
-    """Bulk reconcile for deep history — same ledger, same `snap_slot` grid.
+    """Retained for callers; the set-based reconcile above is already bulk.
 
-    `reconcile_record_feed` does a read plus a write per record, which is right
-    for healing a handful of slots but is 2 × 10^6 round-trips against two years
-    of 1m candles. This batches the same upserts.
-
-    Dropping the per-slot read is safe *only* because this path writes nothing
-    but COMPLETE: `mark`'s guard exists to stop a complete slot being downgraded,
-    and an upsert to COMPLETE can never downgrade anything.
+    Under Mongo this was a genuinely different code path — batched `UpdateOne`s
+    versus a read-plus-write per record. In SQL both collapse to the same single
+    statement, so keeping two implementations would only create the chance for
+    their slot grids to drift apart.
     """
-    from pymongo import UpdateOne
-
-    if feed not in RECORD_BACKED_FEEDS:
-        raise ValueError(f"{feed} is not record-backed")
-    coll_name, granularity_s = RECORD_BACKED_FEEDS[feed]
-    db = get_db()
-    query = {"event_time": {"$gte": since}} if since is not None else {}
-
-    now = datetime.now(timezone.utc)
-    ops: list = []
-    seen: set[datetime] = set()
-    count = 0
-    cursor = db[coll_name].find(query, {"event_time": 1}).sort("event_time", 1)
-    async for doc in cursor:
-        slot = snap_slot(doc["event_time"], granularity_s)
-        if slot in seen:                    # many records can share one slot
-            continue
-        seen.add(slot)
-        ops.append(UpdateOne(
-            {"feed": feed, "slot": slot},
-            {"$set": {"feed": feed, "slot": slot, "state": COMPLETE,
-                      "source": "record", "updated_at": now}},
-            upsert=True,
-        ))
-        if len(ops) >= batch:
-            await db[COVERAGE_COLLECTION].bulk_write(ops, ordered=False)
-            count += len(ops)
-            ops = []
-            seen.clear()
-    if ops:
-        await db[COVERAGE_COLLECTION].bulk_write(ops, ordered=False)
-        count += len(ops)
-    log.info("coverage: reconciled %d slots for %s", count, feed)
-    return count
+    n = await reconcile_record_feed(feed, since=since)
+    log.info("coverage: reconciled %d slots for %s", n, feed)
+    return n
 
 
-async def gaps(feed: str, start: datetime, end: datetime) -> list[datetime]:
+async def gaps(feed: str, start: datetime, end: datetime,
+               venue: str | None = None) -> list[datetime]:
     """Slots in [start, end] NOT marked complete. This is what the backtester
     calls to decide whether a window is safe to evaluate."""
-    db = get_db()
     granularity_s = RECORD_BACKED_FEEDS.get(feed, (None, 60))[1]
     start_slot = snap_slot(start, granularity_s)   # snap the query bound too, or
-    cursor = db[COVERAGE_COLLECTION].find(          # the boundary slot is excluded
-        {"feed": feed, "slot": {"$gte": start_slot, "$lte": end}, "state": COMPLETE},
-        {"slot": 1},
-    )
-    complete = {d["slot"] async for d in cursor}
+    rows = await postgres.fetch(                    # the boundary slot is excluded
+        "SELECT slot FROM coverage_ledger "
+        "WHERE venue = %s AND feed = %s AND state = 'complete' "
+        "  AND slot >= %s AND slot <= %s",
+        (venue or settings.venue, feed, start_slot, end))
+    complete = {r["slot"] for r in rows}
 
     out = []
     step = timedelta(seconds=granularity_s)

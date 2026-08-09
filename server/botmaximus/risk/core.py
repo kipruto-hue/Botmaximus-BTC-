@@ -44,9 +44,11 @@ EDGE_COST_MARGIN = 1.5          # expected edge must be ≥ 1.5× expected cost
 
 
 class RiskCore:
-    def __init__(self, db) -> None:
-        self._db = db
-        self.kills = KillStack(db)
+    def __init__(self, db=None) -> None:
+        # `db` is accepted and ignored: risk state lives in Postgres now, and
+        # keeping the parameter lets the backtester keep constructing a
+        # RiskCore the same way while `size_intent` stays pure.
+        self.kills = KillStack()
         self.portfolio = PortfolioState(
             equity=settings.starting_equity_paper,
             peak_equity=settings.starting_equity_paper,
@@ -57,27 +59,33 @@ class RiskCore:
     # ---- lifecycle ----
     async def load(self) -> None:
         """Restore persisted state. A restart never resets equity, peak, or kills."""
+        from botmaximus.storage import postgres
         await self.kills.load()
-        doc = await self._db[RISK_STATE_COLLECTION].find_one({"_id": PORTFOLIO_DOC_ID})
-        if doc:
+        row = await postgres.fetchrow(
+            "SELECT state FROM risk_state WHERE id = %s", (PORTFOLIO_DOC_ID,))
+        if row:
+            doc = row["state"]
             self.portfolio.equity = doc["equity"]
             self.portfolio.peak_equity = doc["peak_equity"]
             self.portfolio.day_start_equity = doc["day_start_equity"]
             self.portfolio.day_start_date = doc["day_start_date"]
 
     async def _persist_portfolio(self) -> None:
-        await self._db[RISK_STATE_COLLECTION].replace_one(
-            {"_id": PORTFOLIO_DOC_ID},
-            {
-                "_id": PORTFOLIO_DOC_ID,
+        import json
+
+        from botmaximus.storage import postgres
+        await postgres.execute(
+            "INSERT INTO risk_state (id, state, updated_at) "
+            "VALUES (%s, %s, now()) "
+            "ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, "
+            "  updated_at = now()",
+            (PORTFOLIO_DOC_ID, json.dumps({
                 "equity": self.portfolio.equity,
                 "peak_equity": self.portfolio.peak_equity,
                 "day_start_equity": self.portfolio.day_start_equity,
                 "day_start_date": self.portfolio.day_start_date,
-                "updated_at": datetime.now(timezone.utc),
-            },
-            upsert=True,
-        )
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })))
 
     async def update_equity(self, equity: float) -> None:
         """§4.3: the L3/L2 check runs on EVERY equity update, unsuppressably."""
@@ -249,16 +257,19 @@ class RiskCore:
 
     # ---- logging (§2.7) ----
     async def _log_event(self, kind: str, intent: OrderIntent, **fields) -> None:
-        await self._db[RISK_EVENTS_COLLECTION].insert_one({
-            "ts": datetime.now(timezone.utc),
-            "kind": kind,
-            "strategy_id": intent.strategy_id,
-            "direction": intent.direction,
-            "entry_price": intent.entry_price,
-            "stop_price": intent.stop_price,
-            "thesis": intent.thesis,
-            **fields,
-        })
+        import json
+
+        from botmaximus.storage import postgres
+        await postgres.execute(
+            "INSERT INTO risk_events (kind, strategy_id, detail) "
+            "VALUES (%s, %s, %s)",
+            (kind, intent.strategy_id, json.dumps({
+                "direction": intent.direction,
+                "entry_price": intent.entry_price,
+                "stop_price": intent.stop_price,
+                "thesis": intent.thesis,
+                **fields,
+            }, default=str)))
 
     def snapshot(self) -> dict:
         return {

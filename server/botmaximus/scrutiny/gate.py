@@ -112,21 +112,26 @@ class ScrutinyGate:
         return None
 
     async def _record(self, intent: OrderIntent, verdict: ScrutinyVerdict) -> None:
-        doc = {
-            "at": datetime.now(timezone.utc),
-            "strategy_id": intent.strategy_id,
-            "direction": intent.direction,
-            **asdict(verdict),
-        }
+        import json
+        import uuid
+
         try:
-            from botmaximus.db.mongo import get_db
-            await get_db()[SCRUTINY_EVENTS].insert_one(doc)
+            from botmaximus.storage import postgres
+            await postgres.execute(
+                "INSERT INTO scrutiny_events "
+                "(intent_id, strategy_id, at, direction, verdict, reason, "
+                " provider, provider_version, latency_ms, evidence) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (getattr(intent, "intent_id", None) or str(uuid.uuid4()),
+                 intent.strategy_id, datetime.now(timezone.utc),
+                 intent.direction, verdict.verdict, verdict.reason,
+                 verdict.provider, verdict.provider_version,
+                 verdict.latency_ms,
+                 json.dumps(verdict.evidence, default=str)))
         except Exception as e:                          # noqa: BLE001
             await degradation.record("scrutiny_event_write_failed", str(e))
 
 
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[SCRUTINY_EVENTS].create_index([("at", -1)])
-    await db[SCRUTINY_EVENTS].create_index([("verdict", 1), ("at", -1)])
+    """No-op: indexes are part of `schema.sql`."""
+    return None

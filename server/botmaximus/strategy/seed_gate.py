@@ -147,11 +147,11 @@ def report(results: list[dict]) -> None:
 
 
 async def _main(days: int, warmup: int, end: datetime | None) -> None:
-    from botmaximus.db import mongo
+    from botmaximus.storage import postgres
     try:
         report(await run(days, warmup, end=end))
     finally:
-        await mongo.close()
+        await postgres.close()
 
 
 if __name__ == "__main__":

@@ -165,18 +165,20 @@ class Arbiter:
 
     async def _record(self, signals: list[StrategySignal],
                       decision: ArbiterDecision, regime: str | None) -> None:
-        doc = {
-            "at": datetime.now(timezone.utc),
-            "regime": regime,
-            "inputs": [asdict(s) for s in signals],
-            "reason": decision.reason,
-            "scores": decision.scores,
-            "dropped": decision.dropped,
-            "intent": (asdict(decision.intent) if decision.intent else None),
-        }
+        import json
+
         try:
-            from botmaximus.db.mongo import get_db
-            await get_db()[ARBITER_EVENTS].insert_one(doc)
+            from botmaximus.storage import postgres
+            await postgres.execute(
+                "INSERT INTO arbiter_events "
+                "(at, regime, reason, inputs, scores, dropped, intent) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (datetime.now(timezone.utc), regime, decision.reason,
+                 json.dumps([asdict(s) for s in signals], default=str),
+                 json.dumps(decision.scores, default=str),
+                 json.dumps(decision.dropped, default=str),
+                 json.dumps(asdict(decision.intent), default=str)
+                 if decision.intent else None))
         except Exception as e:                          # noqa: BLE001
             await degradation.record(
                 "arbiter_event_write_failed",
@@ -185,7 +187,5 @@ class Arbiter:
 
 
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[ARBITER_EVENTS].create_index([("at", -1)])
-    await db[ARBITER_EVENTS].create_index([("reason", 1), ("at", -1)])
+    """No-op: indexes are part of `schema.sql`."""
+    return None

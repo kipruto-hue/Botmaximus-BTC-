@@ -47,10 +47,13 @@ async def gate1_collector_24h(db) -> GateResult:
     """24 continuous hours, no unbackfillable gaps for OHLCV/funding/OI."""
     now = datetime.now(timezone.utc)
     since = now - timedelta(hours=24)
-    missing = await db["coverage"].count_documents(
-        {"feed": "btc_ohlcv_1m", "slot": {"$gte": since}, "state": {"$ne": "complete"}})
-    complete = await db["coverage"].count_documents(
-        {"feed": "btc_ohlcv_1m", "slot": {"$gte": since}, "state": "complete"})
+    from botmaximus.storage import postgres
+    row = await postgres.fetchrow(
+        "SELECT count(*) FILTER (WHERE state <> 'complete') AS missing, "
+        "       count(*) FILTER (WHERE state = 'complete')  AS complete "
+        "FROM coverage_ledger WHERE feed = 'btc_ohlcv_1m' AND slot >= %s",
+        (since,))
+    missing, complete = row["missing"], row["complete"]
     if complete == 0:
         return GateResult("Gate 1 collector 24h", NO_DATA,
                           "no coverage slots in the last 24h")
@@ -83,8 +86,10 @@ async def gate2_generator_honesty(db) -> GateResult:
         if any(any(c.isdigit() or c in "<>" for c in str(k)) for k in kinds):
             leaked.append(f.name)
 
-    passed = await db["strategies"].count_documents(
-        {"origin": "generated", "lifecycle_state": {"$in": ["paper", "live"]}})
+    from botmaximus.storage import postgres
+    passed = await postgres.fetchval(
+        "SELECT count(*) AS n FROM strategies WHERE origin = 'generated' "
+        "AND lifecycle_state = ANY(%s)", (["paper", "live"],)) or 0
     rate = passed / len(files)
     status = PASS if (rate < 0.05 and not leaked) else FAIL
     return GateResult(
@@ -97,21 +102,26 @@ async def gate2_generator_honesty(db) -> GateResult:
 async def gate3_validated_strategy(db) -> GateResult:
     """200 paper trades, deflated Sharpe >= 2.0 with the lifetime trial count,
     and one holdout burn."""
-    from botmaximus.execution.ledger import LEDGER, RECONCILED
+    from botmaximus.execution.ledger import RECONCILED
+    from botmaximus.storage import postgres
 
-    legs = await db[LEDGER].count_documents({"status": RECONCILED})
+    legs = await postgres.fetchval(
+        "SELECT count(*) AS n FROM execution_ledger_realizations "
+        "WHERE status = %s", (RECONCILED,)) or 0
     if legs < 400:      # two legs per round trip
         return GateResult("Gate 3 validated strategy", NO_DATA,
                           f"{legs // 2}/200 paper round-trips reconciled")
 
-    best = await db["backtest_runs"].find_one(
-        {"verdict.passed": True}, sort=[("metrics.deflated_sharpe", -1)])
+    best = await postgres.fetchrow(
+        "SELECT metrics FROM backtest_runs WHERE passed "
+        "ORDER BY (metrics->>'deflated_sharpe')::float DESC NULLS LAST LIMIT 1")
     if best is None:
         return GateResult("Gate 3 validated strategy", FAIL,
                           "no strategy has passed validation")
-    dsr = (best.get("metrics") or {}).get("deflated_sharpe", 0.0)
-    burned = await db["strategy_events"].count_documents(
-        {"event": "holdout_burned"})
+    dsr = (best["metrics"] or {}).get("deflated_sharpe", 0.0)
+    burned = await postgres.fetchval(
+        "SELECT count(*) AS n FROM strategy_events WHERE event = %s",
+        ("holdout_burned",)) or 0
     status = PASS if (dsr >= 2.0 and burned >= 1) else FAIL
     return GateResult("Gate 3 validated strategy", status,
                       f"best DSR {dsr:.2f} (need >=2.0), holdout burns {burned}",
@@ -143,15 +153,18 @@ async def gate4_cost_model_honest(db) -> GateResult:
 
 async def gate5_kill_flattens(db) -> GateResult:
     """Operator kill flattens with a position open, verified, in under 2s."""
-    ev = await db[__import__(
-        "botmaximus.obs.degradation", fromlist=["x"]).DEGRADED_EVENTS].find_one(
-        {"label": "flatten_unverified"})
-    drill = await db["risk_events"].find_one({"kind": "flatten_drill"},
-                                             sort=[("at", -1)])
-    if drill is None:
+    from botmaximus.storage import postgres
+    ev = await postgres.fetchrow(
+        "SELECT 1 AS x FROM telemetry_events "
+        "WHERE kind = 'degraded' AND label = 'flatten_unverified' LIMIT 1")
+    row = await postgres.fetchrow(
+        "SELECT detail FROM risk_events WHERE kind = 'flatten_drill' "
+        "ORDER BY at DESC LIMIT 1")
+    if row is None:
         return GateResult("Gate 5 kill flattens", NO_DATA,
                           "no flatten drill recorded (needs a live demo "
                           "position and POST /api/risk/master_kill)")
+    drill = row["detail"] or {}
     ok = drill.get("flat") and drill.get("elapsed_ms", 9e9) < 2000 and ev is None
     return GateResult("Gate 5 kill flattens", PASS if ok else FAIL,
                       f"flat={drill.get('flat')} in {drill.get('elapsed_ms')}ms",
@@ -159,9 +172,7 @@ async def gate5_kill_flattens(db) -> GateResult:
 
 
 async def run_all() -> list[GateResult]:
-    from botmaximus.db.mongo import get_db
-
-    db = get_db()
+    db = None       # gates read Postgres directly; kept for signature stability
     out = []
     for fn in (gate1_collector_24h, gate2_generator_honesty,
                gate3_validated_strategy, gate4_cost_model_honest,
@@ -174,7 +185,7 @@ async def run_all() -> list[GateResult]:
 
 
 async def _main() -> None:
-    from botmaximus.db import mongo
+    from botmaximus.storage import postgres
 
     try:
         results = await run_all()
@@ -195,7 +206,7 @@ async def _main() -> None:
               f"(unchanged by this build, regardless of gate status)")
         print("=" * 72)
     finally:
-        await mongo.close()
+        await postgres.close()
 
 
 if __name__ == "__main__":

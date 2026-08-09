@@ -1,64 +1,67 @@
-"""Collection setup (§3.2) — idempotent, run at startup.
+r"""Dataset registry and hot-window policy (Storage v2.0 §3.A).
 
-High-frequency series live in Mongo time-series collections (timeField
-`event_time`, metaField `meta`). Time-series collections are insert-only,
-so dedupe happens in the writer, not via unique indexes.
+What this file used to do — create Mongo time-series collections with TTL
+indexes — has no Postgres equivalent, and the replacement is not a translation
+but a different mechanism:
+
+- **Time-series collections** → daily RANGE partitions of `market_records`,
+  managed by `storage/partitions.py`.
+- **TTL indexes** → the nightly tier-out job (§4). A TTL index deletes data
+  once it is old enough; tier-out only drops a Postgres partition *after*
+  verifying the Parquet copy exists and its checksum matches. The difference
+  matters: a TTL index would happily expire the only copy of a day the archive
+  never received, and it would do it silently.
+- **A quarantine collection** → a separate Object Storage bucket that no hot
+  path reads (§3.J).
+
+So what remains here is the registry: which datasets exist, and how long each
+one's hot window is. `ensure_schema()` is kept as the boot-time entry point so
+callers do not need to know that the mechanism underneath changed.
 """
+from __future__ import annotations
+
 import logging
 
 from botmaximus.config import settings
-from botmaximus.db.mongo import get_db
+from botmaximus.storage import partitions, postgres
 
 log = logging.getLogger(__name__)
 
-# dataset_id → collection name
-DATASET_COLLECTIONS = {
-    "btc_price_tick": "btc_price_ticks",
-    "btc_ohlcv_1m": "btc_ohlcv_1m",
-    "btc_funding": "btc_funding",
-    "btc_open_interest": "btc_open_interest",
-    "btc_liquidation": "btc_liquidations",
-    "btc_orderbook": "btc_orderbook",
-    "btc_funding_8h": "btc_funding_8h",
-    "btc_oi_5m": "btc_oi_5m",
+#: Every dataset the collectors produce. The value is the hot-window length in
+#: hours (§3.A); everything older lives only in Parquet.
+#:
+#: These are per-dataset on purpose. Ticks age out in a day because nothing
+#: reads a week-old tick from Postgres, while funding is kept for 30 days
+#: because the cost model charges from settled funding across every settlement
+#: a position spans and reaches back further than the rest.
+DATASETS: dict[str, str] = {
+    "btc_price_tick": "hot_window_hours_ticks",
+    "btc_ohlcv_1m": "hot_window_hours_ohlcv",
+    "btc_funding": "hot_window_hours_funding",
+    "btc_open_interest": "hot_window_hours_open_interest",
+    "btc_liquidation": "hot_window_hours_liquidations",
+    "btc_orderbook": "hot_window_hours_orderbook",
+    # settled historical series used by the cost model and coverage
+    "btc_funding_8h": "hot_window_hours_funding",
+    "btc_oi_5m": "hot_window_hours_open_interest",
 }
 
-TIMESERIES = {
-    "btc_price_ticks": {"granularity": "seconds", "ttl_s": settings.ttl_price_ticks_s},
-    "btc_ohlcv_1m": {"granularity": "minutes", "ttl_s": settings.ttl_ohlcv_1m_s},
-    "btc_funding": {"granularity": "seconds", "ttl_s": settings.ttl_funding_s},
-    "btc_open_interest": {"granularity": "seconds", "ttl_s": settings.ttl_open_interest_s},
-    "btc_liquidations": {"granularity": "seconds", "ttl_s": settings.ttl_liquidations_s},
-    "btc_orderbook": {"granularity": "seconds", "ttl_s": settings.ttl_orderbook_s},
-    # settled historical series (cost model + coverage) — kept long, no TTL churn
-    "btc_funding_8h": {"granularity": "hours", "ttl_s": settings.ttl_funding_s},
-    "btc_oi_5m": {"granularity": "minutes", "ttl_s": settings.ttl_open_interest_s},
-}
+#: Feeds with no history endpoint on any venue. An hour of downtime is an hour
+#: gone permanently, which is why uptime — not backfill — is what protects them.
+UNRECOVERABLE = ("btc_liquidation", "btc_orderbook", "btc_price_tick")
 
-QUARANTINE = "quarantine"
+
+def hot_window_hours(dataset_id: str) -> int:
+    attr = DATASETS.get(dataset_id)
+    if attr is None:
+        return settings.hot_window_hours_default
+    return getattr(settings, attr, settings.hot_window_hours_default)
 
 
 async def ensure_schema() -> None:
-    db = get_db()
-    existing = set(await db.list_collection_names())
-
-    for name, opts in TIMESERIES.items():
-        if name not in existing:
-            await db.create_collection(
-                name,
-                timeseries={
-                    "timeField": "event_time",
-                    "metaField": "meta",
-                    "granularity": opts["granularity"],
-                },
-                expireAfterSeconds=opts["ttl_s"],
-            )
-            log.info("created time-series collection %s", name)
-        coll = db[name]
-        await coll.create_index([("meta.dataset_id", 1), ("event_time", 1)])
-
-    if QUARANTINE not in existing:
-        await db.create_collection(QUARANTINE)
-        log.info("created collection %s", QUARANTINE)
-    await db[QUARANTINE].create_index([("event_time", 1)])
-    await db[QUARANTINE].create_index([("meta.dataset_id", 1), ("event_time", 1)])
+    """Idempotent boot-time storage setup: apply the DDL, then make sure the
+    partitions the collector is about to write into already exist."""
+    await postgres.bootstrap()
+    made = await partitions.ensure_ahead(days=3)
+    log.info("storage ready: %d dataset(s), partitions through %s",
+             len(DATASETS), made[-1] if made else "n/a")

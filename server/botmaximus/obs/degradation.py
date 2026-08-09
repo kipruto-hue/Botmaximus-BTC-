@@ -42,10 +42,8 @@ _counts: Counter[str] = Counter()
 
 
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[DEGRADED_EVENTS].create_index([("at", -1)])
-    await db[DEGRADED_EVENTS].create_index([("label", 1), ("at", -1)])
+    """No-op: indexes are part of `schema.sql`."""
+    return None
 
 
 async def record(label: str, reason: str, **context) -> None:
@@ -58,13 +56,7 @@ async def record(label: str, reason: str, **context) -> None:
     _counts[label] += 1
     log.warning("DEGRADED [%s] %s %s", label, reason, context or "")
     try:
-        from botmaximus.db.mongo import get_db
-        await get_db()[DEGRADED_EVENTS].insert_one({
-            "label": label,
-            "reason": reason,
-            "context": context,
-            "at": datetime.now(timezone.utc),
-        })
+        await _write(label, reason, context)
     except Exception as e:                      # noqa: BLE001
         # The counter already moved, so the degradation is not lost. Raising
         # here would let a bookkeeping failure escalate a survivable fallback
@@ -90,13 +82,21 @@ def record_sync(label: str, reason: str, **context) -> None:
     loop.create_task(_persist(label, reason, context))
 
 
+async def _write(label: str, reason: str, context: dict) -> None:
+    """Degradations land in `telemetry_events` with kind='degraded' (§7)."""
+    import json
+
+    from botmaximus.storage import postgres
+    await postgres.execute(
+        "INSERT INTO telemetry_events (kind, label, reason, context, at) "
+        "VALUES ('degraded', %s, %s, %s, %s)",
+        (label, reason, json.dumps(context, default=str),
+         datetime.now(timezone.utc)))
+
+
 async def _persist(label: str, reason: str, context: dict) -> None:
     try:
-        from botmaximus.db.mongo import get_db
-        await get_db()[DEGRADED_EVENTS].insert_one({
-            "label": label, "reason": reason, "context": context,
-            "at": datetime.now(timezone.utc),
-        })
+        await _write(label, reason, context)
     except Exception as e:                      # noqa: BLE001
         log.error("could not persist degraded event %s: %s", label, e)
 

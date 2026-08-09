@@ -22,7 +22,6 @@ from botmaximus.scrutiny.provider import APPROVE, VETO, ScrutinyProvider, Scruti
 from botmaximus.strategy import decay as decay_mod
 from botmaximus.strategy.decay import DecayMonitor, DecayTrigger, current_losing_run
 from botmaximus.strategy.generator import Generator, NullProposer, coarsen
-from tests.test_gate_hardening import FakeDB
 
 
 # =====================================================================
@@ -67,11 +66,10 @@ class FakeRisk:
 
 
 @pytest.fixture
-def db(monkeypatch):
-    fake = FakeDB()
-    from botmaximus.db import mongo
-    monkeypatch.setattr(mongo, "get_db", lambda: fake)
-    return fake
+def db(pg):
+    """Kept under its old name so the tests below read unchanged; it is now a
+    real, empty Postgres schema rather than a fake collection."""
+    return pg
 
 
 def sig(sid="s1", direction="LONG", conf=0.8, **kw):
@@ -162,9 +160,9 @@ async def test_every_decision_is_recorded_including_the_refusals(db):
     """'Why didn't it trade?' is unanswerable from a log of trades that did."""
     a = Arbiter(FakeRisk())
     await a.decide([sig("s1", "LONG"), sig("s2", "SHORT")])
-    from botmaximus.arbiter.core import ARBITER_EVENTS
-    assert len(db[ARBITER_EVENTS].docs) == 1
-    assert db[ARBITER_EVENTS].docs[0]["reason"] == "conflict"
+    rows = await db.fetch("SELECT * FROM arbiter_events")
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "conflict"
 
 
 # =====================================================================
@@ -418,4 +416,7 @@ async def test_decay_suspends_the_strategy(db):
     v = await m.evaluate("s1", [1.0] * 50 + [-1.0] * 12, 0.55)
     await m.on_decay(v)
     assert r.kills.suspended["s1"] == "alpha_decay"
-    assert len(db[decay_mod.DECAY_EVENTS].docs) == 1
+    rows = await db.fetch(
+        "SELECT * FROM strategy_events WHERE event = 'decay'")
+    assert len(rows) == 1
+    assert rows[0]["detail"]["cause"] == "alpha_decay"

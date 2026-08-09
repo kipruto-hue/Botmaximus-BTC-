@@ -23,84 +23,11 @@ from botmaximus.strategy.seeds import seed_definitions
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-# =====================================================================
-# Fake Mongo — enough of the update_one/$inc/$setOnInsert contract
-# =====================================================================
-class FakeCursor:
-    """Enough of the PyMongo cursor contract for find().sort().limit()."""
-    def __init__(self, docs: list[dict]):
-        self.docs = docs
-
-    def sort(self, field, direction=1):
-        self.docs = sorted(self.docs, key=lambda d: d.get(field) or 0,
-                           reverse=direction < 0)
-        return self
-
-    def limit(self, n):
-        self.docs = self.docs[:n]
-        return self
-
-    async def __aiter__(self):
-        for d in self.docs:
-            yield d
-
-
-class FakeCollection:
-    def __init__(self):
-        self.docs: list[dict] = []
-
-    @staticmethod
-    def _match(doc: dict, query: dict) -> bool:
-        return all(doc.get(k) == v for k, v in query.items())
-
-    def find(self, query=None, projection=None):
-        return FakeCursor([dict(d) for d in self.docs
-                           if self._match(d, query or {})])
-
-    async def find_one(self, query, projection=None, sort=None):
-        rows = [d for d in self.docs if self._match(d, query)]
-        if sort:
-            field, direction = sort[0]
-            rows = sorted(rows, key=lambda d: d.get(field) or 0,
-                          reverse=direction < 0)
-        return rows[0] if rows else None
-
-    async def insert_one(self, doc):
-        self.docs.append(dict(doc))
-
-    async def update_one(self, query, update, upsert=False):
-        doc = await self.find_one(query)
-        if doc is None:
-            if not upsert:
-                return
-            doc = dict(update.get("$setOnInsert", {}))
-            self.docs.append(doc)
-        doc.update(update.get("$set", {}))
-        for k, v in update.get("$inc", {}).items():
-            doc[k] = doc.get(k, 0) + v
-
-    async def count_documents(self, query):
-        return sum(1 for d in self.docs if self._match(d, query))
-
-    async def distinct(self, field):
-        return list({d.get(field) for d in self.docs if field in d})
-
-    async def create_index(self, *a, **kw):
-        return None
-
-
-class FakeDB(dict):
-    def __missing__(self, key):
-        self[key] = FakeCollection()
-        return self[key]
-
-
 @pytest.fixture
-def db(monkeypatch):
-    fake = FakeDB()
-    from botmaximus.db import mongo
-    monkeypatch.setattr(mongo, "get_db", lambda: fake)
-    return fake
+def db(pg):
+    """Kept under its old name so the tests below read unchanged; it is now a
+    real, empty Postgres schema rather than a fake collection."""
+    return pg
 
 
 # =====================================================================
@@ -173,9 +100,15 @@ async def test_ledger_survives_a_restart(db):
     defn = seed_definitions()[0]
     await trials.record(defn, "cfg-a")
     await trials.record(defn, "cfg-b")
-    from botmaximus.db import mongo          # a "new process" reading the same db
+
+    # Simulate the restart properly: drop the pool and reopen it, so the count
+    # comes back from the database rather than from anything held in memory.
+    from botmaximus.storage import postgres
+    await postgres.close()
+    postgres.reset_for_tests()
+    await postgres.open_pool()
+
     assert await trials.count() == 2
-    assert mongo.get_db() is db
 
 
 @pytest.mark.asyncio

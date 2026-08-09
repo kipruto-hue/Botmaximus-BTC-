@@ -6,17 +6,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from botmaximus.backtest.engine import BacktestResult
 from botmaximus.backtest.validation import ValidationVerdict
 
+log = logging.getLogger(__name__)
+
 BACKTEST_RUNS_COLLECTION = "backtest_runs"
 
-#: The equity curve carries one point per evaluated bar, so a multi-year 1m
-#: window is ~10^6 points and blows past Mongo's 16MB document limit. It is a
-#: display artefact — the trade list is the reproducible record, and the curve
-#: can be rebuilt from it — so it is stored downsampled rather than dropped.
+#: Downsampling limit for the curve returned to *callers and the dashboard*.
+#:
+#: This used to be a storage constraint: one point per evaluated bar means a
+#: multi-year 1m window is ~10^6 points, which blew past Mongo's 16MB document
+#: limit. Parquet has no such limit and is columnar, so the archive now keeps
+#: the curve at full resolution (§3.H) and this is only about what a JSON
+#: response should carry.
 MAX_CURVE_POINTS = 5_000
 
 
@@ -39,12 +45,22 @@ def downsample_curve(curve: list, max_points: int = MAX_CURVE_POINTS) -> tuple[l
 
 
 def build_run_doc(strategy_id: str, config: dict, coverage_summary: dict,
-                  result: BacktestResult, verdict: ValidationVerdict) -> dict:
+                  result: BacktestResult, verdict: ValidationVerdict,
+                  as_of: datetime | None = None) -> dict:
+    """Assemble the run record.
+
+    `as_of` is required to persist (§6) but deliberately NOT part of
+    `config_hash`. It changes on every run, so hashing it would give every run
+    a unique hash — defeating the replay-dedupe the hash exists for, and
+    inflating the lifetime trial ledger on every restart, which is precisely
+    the multiple-testing correction this system is trying to keep honest.
+    """
     curve, stride = downsample_curve(result.equity_curve)
     return {
         "strategy_id": strategy_id,
         "config_hash": config_hash(config),
         "config": config,
+        "as_of": as_of,
         "created_at": datetime.now(timezone.utc),
         "coverage": coverage_summary,
         "verdict": {"passed": verdict.passed, "reasons": verdict.reasons},
@@ -70,6 +86,59 @@ def build_run_doc(strategy_id: str, config: dict, coverage_summary: dict,
 
 
 async def save_run(doc: dict) -> str:
-    from botmaximus.db.mongo import get_db
-    await get_db()[BACKTEST_RUNS_COLLECTION].insert_one(doc)
+    """Metadata to Postgres, curve and trades to Parquet (§3.H).
+
+    Refuses without `as_of`: §6 calls an unpinned backtest a defect, and
+    `backtest_runs.as_of` is NOT NULL so such a run is unrecordable anyway.
+    Failing here gives the operator the reason rather than a constraint
+    violation from three layers down.
+    """
+    import uuid
+
+    import pyarrow as pa
+
+    from botmaximus.storage import postgres, records as store
+
+    if not doc.get("as_of"):
+        raise ValueError(
+            "refusing to persist a backtest run with no `as_of` (§6): without "
+            "a pinned instant the run cannot be reproduced, because a re-run "
+            "would silently read any corrections that landed since.")
+
+    run_id = str(uuid.uuid4())
+    curve_key = None
+    try:
+        # Full resolution in the archive — the downsampled copy in `doc` is for
+        # display. This is the reproducible record.
+        table = pa.table({
+            "kind": (["curve"] * len(doc["equity_curve"])
+                     + ["trade"] * len(doc["trades"])),
+            "json": ([json.dumps(p) for p in doc["equity_curve"]]
+                     + [json.dumps(t) for t in doc["trades"]]),
+        })
+        written = store.archive().write_blob(
+            f"backtest/{run_id}.parquet", table, dataset_id="backtest_run",
+            partition=f"run={run_id}")
+        curve_key = written.key
+        await store._record_manifest(written)
+    except Exception as e:                              # noqa: BLE001
+        # §7: the archive being unreachable must not lose the verdict. The
+        # metadata row still lands, with a null blob key that the §11 integrity
+        # check will report rather than hide.
+        log.error("backtest curve archive failed for %s: %s", run_id, e)
+
+    v = doc["verdict"]
+    await postgres.execute(
+        "INSERT INTO backtest_runs (backtest_run_id, strategy_id, config_hash, "
+        " as_of, window_start, window_end, n_trials, passed, reasons, metrics, "
+        " coverage, curve_blob_key) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (run_id, doc["strategy_id"], doc["config_hash"], doc["as_of"],
+         _window(doc, 0), _window(doc, 1), doc.get("n_trials", 1),
+         v["passed"], v["reasons"], json.dumps(doc["metrics"], default=str),
+         json.dumps(doc["coverage"], default=str), curve_key))
     return doc["config_hash"]
+
+
+def _window(doc: dict, i: int) -> datetime:
+    return datetime.fromisoformat(doc["config"]["window"][i])

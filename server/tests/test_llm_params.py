@@ -14,17 +14,15 @@ from botmaximus.config import Settings, settings
 from botmaximus.llm import client, context, guards, params, prompts
 from botmaximus.llm.guards import PromptLeak
 from botmaximus.risk.state import OrderIntent
-from tests.test_gate_hardening import FakeDB
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture
-def db(monkeypatch):
-    fake = FakeDB()
-    from botmaximus.db import mongo
-    monkeypatch.setattr(mongo, "get_db", lambda: fake)
-    return fake
+def db(pg):
+    """Kept under its old name so the tests below read unchanged; it is now a
+    real, empty Postgres schema rather than a fake collection."""
+    return pg
 
 
 # =====================================================================

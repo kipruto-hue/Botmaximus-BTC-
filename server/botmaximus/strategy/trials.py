@@ -44,11 +44,13 @@ TRIAL_LEDGER = "trial_ledger"
 
 
 async def ensure_indexes() -> None:
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    await db[TRIAL_LEDGER].create_index([("sig_hash", 1), ("config_hash", 1)],
-                                        unique=True)
-    await db[TRIAL_LEDGER].create_index([("sig_hash", 1)])
+    """No-op: `trials`'s composite primary key is declared in `schema.sql`.
+
+    Under Mongo the uniqueness of (sig_hash, config_hash) depended on this
+    function having been called. It is now part of the table definition, so the
+    ledger cannot exist without it.
+    """
+    return None
 
 
 def signature_hash(defn: StrategyDefinition) -> str:
@@ -65,35 +67,33 @@ async def record(defn: StrategyDefinition, config_hash: str) -> int:
     Upsert-on-insert: an identical (signature, config) re-run touches
     `last_seen` and increments `replays`, but does not add a trial.
     """
-    from botmaximus.db.mongo import get_db
-    db = get_db()
-    now = datetime.now(timezone.utc)
+    from botmaximus.storage import postgres
     sig = signature_hash(defn)
-    await db[TRIAL_LEDGER].update_one(
-        {"sig_hash": sig, "config_hash": config_hash},
-        {
-            "$setOnInsert": {"sig_hash": sig, "config_hash": config_hash,
-                             "strategy_id": defn.id, "first_seen": now},
-            "$set": {"last_seen": now},
-            "$inc": {"replays": 1},
-        },
-        upsert=True,
-    )
+    # ON CONFLICT DO UPDATE, not DO NOTHING: a replay must still touch
+    # `last_seen` and bump `replays`, while `first_seen` and the row itself
+    # stay as they were — the count is what must not move.
+    await postgres.execute(
+        "INSERT INTO trials (sig_hash, config_hash, strategy_id, "
+        "                    first_seen, last_seen, replays) "
+        "VALUES (%s, %s, %s, now(), now(), 1) "
+        "ON CONFLICT (sig_hash, config_hash) DO UPDATE SET "
+        "  last_seen = now(), replays = trials.replays + 1",
+        (sig, config_hash, defn.id))
     return await count()
 
 
 async def count() -> int:
     """Lifetime trials. Never resets, never decrements."""
-    from botmaximus.db.mongo import get_db
-    return await get_db()[TRIAL_LEDGER].count_documents({})
+    from botmaximus.storage import postgres
+    return await postgres.fetchval("SELECT count(*) AS n FROM trials") or 0
 
 
 async def distinct_ideas() -> int:
     """Distinct structural signatures ever evaluated — reporting only. This is
     NOT the number fed to the deflated Sharpe; see the module docstring."""
-    from botmaximus.db.mongo import get_db
-    sigs = await get_db()[TRIAL_LEDGER].distinct("sig_hash")
-    return len(sigs)
+    from botmaximus.storage import postgres
+    return await postgres.fetchval(
+        "SELECT count(DISTINCT sig_hash) AS n FROM trials") or 0
 
 
 async def summary() -> dict:

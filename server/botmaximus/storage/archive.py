@@ -185,6 +185,8 @@ def records_to_table(records: list[Record]) -> pa.Table:
         "quality_ok": pa.array([r["quality_ok"] for r in rows], pa.bool_()),
         "quality_gate_version": pa.array([r["quality_gate_version"] for r in rows],
                                          pa.int32()),
+        "annotations": pa.array([",".join(r["annotations"]) for r in rows],
+                                pa.string()),
         "payload": pa.array([json.dumps(r["payload"], default=str) for r in rows],
                             pa.string()),
     })
@@ -242,6 +244,27 @@ class Archive:
             sha256=hashlib.sha256(data).hexdigest(),
             dataset_id=records[0].dataset_id, partition=partition,
             written_at=datetime.now(timezone.utc))
+
+    def write_blob(self, key: str, table: pa.Table, *, dataset_id: str,
+                   partition: str = "", bucket: str | None = None) -> WrittenFile:
+        """Write an arbitrary table at an explicit key.
+
+        `write` exists for envelope-carrying market records and enforces their
+        rules — one day per file, clean records only. The permanent record also
+        holds things that are not market records: equity curves and trade lists
+        (§3.H), LLM prompt and response blobs (§3.G). Those have their own
+        shapes and their own keys, but they still belong in the archive and
+        still get a manifest row with a checksum, which is what this provides.
+        """
+        buf = io.BytesIO()
+        pq.write_table(table, buf, compression="zstd")
+        data = buf.getvalue()
+        target = bucket or self.archive_bucket
+        self.backend.put(target, key, data)
+        return WrittenFile(
+            bucket=target, key=key, rows=table.num_rows, bytes=len(data),
+            sha256=hashlib.sha256(data).hexdigest(), dataset_id=dataset_id,
+            partition=partition, written_at=datetime.now(timezone.utc))
 
     def read(self, key: str, bucket: str | None = None) -> pa.Table:
         return pq.read_table(io.BytesIO(

@@ -26,8 +26,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from botmaximus.config import settings
-from botmaximus.db.mongo import get_db
-from botmaximus.db.schema import DATASET_COLLECTIONS, ensure_schema
+from botmaximus.db.schema import ensure_schema
+from botmaximus.storage import postgres
 from botmaximus.pipeline.backfill import MINUTE_MS, kline_row_to_ws_shape, minute_close
 from botmaximus.pipeline.bus import RawItem
 from botmaximus.pipeline.envelope import utcnow
@@ -80,12 +80,13 @@ class DeepOhlcvHistory:
 
     async def _existing_closes(self, start: datetime, end: datetime) -> set[datetime]:
         """Every candle close already stored in the window, in one index scan."""
-        cursor = get_db()[DATASET_COLLECTIONS[self.dataset_id]].find(
-            {"meta.dataset_id": self.dataset_id,
-             "event_time": {"$gte": start, "$lte": end}},
-            {"event_time": 1},
-        )
-        return {d["event_time"] async for d in cursor}
+        rows = await postgres.fetch(
+            "SELECT event_time FROM market_records "
+            "WHERE venue = %s AND dataset_id = %s "
+            "  AND event_time >= %s AND event_time <= %s "
+            "  AND valid_to_sys IS NULL",
+            (settings.venue, self.dataset_id, start, end))
+        return {r["event_time"] for r in rows}
 
     async def _fetch(self, client: httpx.AsyncClient, start_ms: int, end_ms: int) -> list:
         """One page, retrying on rate limit. 429 carries Retry-After; 418 means
@@ -197,14 +198,19 @@ class DeepOhlcvHistory:
 
 
 async def _main(days: int) -> None:
-    from botmaximus.db import mongo
     try:
         result = await DeepOhlcvHistory(days).run()
-        total = await get_db()[DATASET_COLLECTIONS["btc_ohlcv_1m"]].estimated_document_count()
-        log.info("btc_ohlcv_1m total documents: %d (this run stored %d)",
-                 total, result["stored"])
+        # The hot window, not the whole history: everything past it lives in
+        # Parquet by design, so this count is "what Postgres is currently
+        # serving", not "how much history exists".
+        total = await postgres.fetchval(
+            "SELECT count(*) AS n FROM market_records "
+            "WHERE venue = %s AND dataset_id = 'btc_ohlcv_1m'",
+            (settings.venue,))
+        log.info("btc_ohlcv_1m rows in the Postgres hot window: %d "
+                 "(this run stored %d)", total, result["stored"])
     finally:
-        await mongo.close()
+        await postgres.close()
 
 
 if __name__ == "__main__":

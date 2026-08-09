@@ -14,10 +14,9 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from botmaximus.config import settings
-from botmaximus.db.mongo import get_db
-from botmaximus.db.schema import DATASET_COLLECTIONS
 from botmaximus.pipeline.bus import RawItem
 from botmaximus.pipeline.envelope import utcnow
+from botmaximus.storage import postgres, records as store
 
 log = logging.getLogger(__name__)
 
@@ -65,17 +64,14 @@ class OhlcvBackfiller:
         """Scan from the last stored candle → now, so a shutdown of any length
         heals completely (§5.1: never a fixed window that silently truncates).
         Empty DB → fall back to the configured deep-seed window."""
-        db = get_db()
-        doc = await db[DATASET_COLLECTIONS["btc_ohlcv_1m"]].find_one(
-            {}, sort=[("event_time", -1)], projection={"event_time": 1}
-        )
-        if not doc:
+        newest = await store.last_event_time("btc_ohlcv_1m",
+                                             venue=settings.venue)
+        if newest is None:
             return settings.backfill_startup_scan_minutes
-        gap_minutes = (datetime.now(timezone.utc) - doc["event_time"]).total_seconds() / 60
+        gap_minutes = (datetime.now(timezone.utc) - newest).total_seconds() / 60
         return max(settings.backfill_scan_minutes, int(gap_minutes) + 2)
 
     async def _find_gaps(self, scan_minutes: int) -> list[datetime]:
-        db = get_db()
         now = datetime.now(timezone.utc)
         window_start = now - timedelta(minutes=scan_minutes)
         # exclude the current (still open) minute and the one just closed —
@@ -83,10 +79,15 @@ class OhlcvBackfiller:
         window_end = now - timedelta(minutes=2)
         if window_end <= window_start:
             return []
-        cursor = db[DATASET_COLLECTIONS["btc_ohlcv_1m"]].find(
-            {"event_time": {"$gte": window_start}}, {"event_time": 1}
-        )
-        existing = {d["event_time"] async for d in cursor}  # tz_aware client → UTC datetimes
+        # Only the current truth counts as coverage: a superseded record was
+        # replaced for a reason, and treating it as a filled minute would stop
+        # the corrected bar from ever being fetched.
+        rows = await postgres.fetch(
+            "SELECT event_time FROM market_records "
+            "WHERE venue = %s AND dataset_id = 'btc_ohlcv_1m' "
+            "  AND event_time >= %s AND valid_to_sys IS NULL",
+            (settings.venue, window_start))
+        existing = {r["event_time"] for r in rows}
         return missing_minutes(existing, window_start, window_end)
 
     async def _fetch_and_enqueue(self, client: httpx.AsyncClient, gaps: list[datetime]) -> None:

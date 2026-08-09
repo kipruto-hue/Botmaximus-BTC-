@@ -13,8 +13,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from botmaximus.config import settings
-from botmaximus.db import mongo
-from botmaximus.db.schema import DATASET_COLLECTIONS, QUARANTINE, ensure_schema
+from botmaximus.db.schema import DATASETS, ensure_schema
+from botmaximus.storage import degrade as storage_degrade
+from botmaximus.storage import jobs as storage_jobs
+from botmaximus.storage import postgres
 from botmaximus.arbiter import core as arbiter_core
 from botmaximus.execution import venue
 from botmaximus.execution import ledger as execution_ledger
@@ -114,14 +116,19 @@ async def lifespan(app: FastAPI):
                  vc.taker_fee_rate, vc.fee_source)
 
     # risk core loads persisted equity/peak/kill state — a restart never resets it
-    risk_core = RiskCore(mongo.get_db())
+    risk_core = RiskCore()
     await risk_core.load()
 
     writer = Writer()
     await writer.seed_dedupe()
     pipeline = Pipeline(parser=_venue_parser(), gate=QualityGate(), writer=writer)
     pipeline.start()
-    sources = _venue_sources(pipeline.gather_q) + [CoverageHeartbeat()]
+    # Storage jobs run alongside the collectors: tier-out nightly, integrity
+    # hourly, checksum audit weekly (§4, §8, §11). They are supervised the same
+    # way, because a storage job that dies silently leaves the condition it was
+    # watching for unobserved.
+    sources = (_venue_sources(pipeline.gather_q) + [CoverageHeartbeat()]
+               + storage_jobs.all_jobs())
     log.info("venue: %s (%s %s)", settings.venue, settings.symbol,
              settings.bybit_category if settings.venue == "bybit" else "futures")
     source_tasks = [
@@ -135,7 +142,7 @@ async def lifespan(app: FastAPI):
             t.cancel()
         await asyncio.gather(*source_tasks, return_exceptions=True)
         await pipeline.stop()
-        await mongo.close()
+        await postgres.close()
 
 
 app = FastAPI(title="BOTMAXIMUS (BTC) data layer", lifespan=lifespan)
@@ -148,7 +155,13 @@ app.add_middleware(
 
 
 def _serialize(doc: dict) -> dict:
-    doc["_id"] = str(doc["_id"])
+    doc = dict(doc)
+    doc.pop("_id", None)
+    for k, v in list(doc.items()):
+        # uuid/Decimal are not JSON-serialisable; the dashboard only displays
+        # these, so a lossless string beats a 500.
+        if type(v).__name__ in ("UUID", "Decimal"):
+            doc[k] = str(v)
     for k in ("event_time", "collection_time", "ingest_time"):
         if doc.get(k) is not None:
             doc[k] = doc[k].isoformat()
@@ -164,7 +177,7 @@ async def health():
     return {
         "status": "ok" if telemetry.ws_connected else "degraded",
         "ws_connected": telemetry.ws_connected,
-        "mongo": await mongo.ping(),
+        "postgres": await postgres.ping(),
         "uptime_s": round(__import__("time").time() - telemetry.started_at),
     }
 
@@ -172,6 +185,32 @@ async def health():
 @app.get("/api/telemetry")
 async def get_telemetry():
     return telemetry.snapshot()
+
+
+@app.get("/api/storage")
+async def get_storage():
+    """§11 storage telemetry: hot-window size per dataset, archive and
+    quarantine growth, partitions, recent tier-outs, backup age and the last
+    restore drill.
+
+    Quarantine growth is on this panel deliberately — a spike there is a signal
+    (venue outage, gate misfire, upstream corruption), and it is invisible
+    anywhere else because no other consumer is allowed to read that bucket.
+    """
+    from botmaximus.storage import integrity, retention, tiering
+    return {
+        "tiering": await tiering.status(),
+        "integrity": await integrity.status(),
+        "retention": retention.summary(),
+        "degradation": await storage_degrade.health(),
+    }
+
+
+@app.get("/api/storage/integrity")
+async def run_storage_integrity():
+    """Run the §11 checks now rather than waiting for the hourly job."""
+    from botmaximus.storage import integrity
+    return {"results": [r.to_dict() for r in await integrity.run_all()]}
 
 
 @app.get("/api/risk")
@@ -241,36 +280,52 @@ async def get_coverage(feed: str = "btc_ohlcv_1m", hours: int = 24):
     return await coverage.summary(feed, start, end)
 
 
+async def _latest(dataset_id: str, limit: int) -> list[dict]:
+    """Most recent records for a dataset, from the Postgres hot window.
+
+    Only the hot window: anything older lives in Parquet, and §12 is explicit
+    that the dashboard never reads Parquet directly. An endpoint that silently
+    reached into the archive would turn a 200ms panel into a multi-second scan.
+    """
+    rows = await postgres.fetch(
+        "SELECT * FROM market_records "
+        "WHERE venue = %s AND dataset_id = %s AND valid_to_sys IS NULL "
+        "ORDER BY event_time DESC LIMIT %s",
+        (settings.venue, dataset_id, min(limit, 500)))
+    return [_serialize(r) for r in rows]
+
+
 @app.get("/api/ohlcv")
 async def get_ohlcv(limit: int = 10):
-    db = mongo.get_db()
-    cursor = db[DATASET_COLLECTIONS["btc_ohlcv_1m"]].find().sort("event_time", -1).limit(min(limit, 500))
-    return [_serialize(d) async for d in cursor]
+    return await _latest("btc_ohlcv_1m", limit)
 
 
 @app.get("/api/ticks")
 async def get_ticks(limit: int = 10):
-    db = mongo.get_db()
-    cursor = db[DATASET_COLLECTIONS["btc_price_tick"]].find().sort("event_time", -1).limit(min(limit, 500))
-    return [_serialize(d) async for d in cursor]
+    return await _latest("btc_price_tick", limit)
 
 
 @app.get("/api/data/{dataset_id}")
 async def get_dataset(dataset_id: str, limit: int = 10):
     """Latest records for any dataset (funding, OI, liquidations, order book, …)."""
-    coll = DATASET_COLLECTIONS.get(dataset_id)
-    if coll is None:
-        return {"error": f"unknown dataset_id; one of {sorted(DATASET_COLLECTIONS)}"}
-    db = mongo.get_db()
-    cursor = db[coll].find().sort("event_time", -1).limit(min(limit, 500))
-    return [_serialize(d) async for d in cursor]
+    if dataset_id not in DATASETS:
+        return {"error": f"unknown dataset_id; one of {sorted(DATASETS)}"}
+    return await _latest(dataset_id, limit)
 
 
 @app.get("/api/quarantine")
 async def get_quarantine(limit: int = 20):
-    db = mongo.get_db()
-    cursor = db[QUARANTINE].find().sort("event_time", -1).limit(min(limit, 200))
-    return [_serialize(d) async for d in cursor]
+    """Quarantine POINTERS, not payloads.
+
+    The rejected records themselves live in the quarantine bucket (§3.J), which
+    no hot path reads. What Postgres holds — and what this returns — is the
+    index: which dataset, which check failed, and the archive key to go and
+    look at if an operator is investigating.
+    """
+    rows = await postgres.fetch(
+        "SELECT * FROM quality_events ORDER BY at DESC LIMIT %s",
+        (min(limit, 200),))
+    return [_serialize(r) for r in rows]
 
 
 MASTER_KILL_TOKEN = "CONFIRM-MASTER-KILL"
@@ -313,19 +368,19 @@ async def get_calibration(strategy_id: str | None = None):
 async def get_arbiter_events(limit: int = 50):
     """Real decisions, including the refusals. `reason` explains every
     no-trade: conflict, cooldown, outside_window, position_open, all_stale."""
-    db = mongo.get_db()
-    cursor = db[arbiter_core.ARBITER_EVENTS].find({}, {"_id": 0}) \
-        .sort("at", -1).limit(min(limit, 200))
-    return [_serialize(d) async for d in cursor]
+    rows = await postgres.fetch(
+        "SELECT * FROM arbiter_events ORDER BY at DESC LIMIT %s",
+        (min(limit, 200),))
+    return [_serialize(r) for r in rows]
 
 
 @app.get("/api/scrutiny/events")
 async def get_scrutiny_events(limit: int = 50):
-    db = mongo.get_db()
-    cursor = db[scrutiny_gate.SCRUTINY_EVENTS].find({}, {"_id": 0}) \
-        .sort("at", -1).limit(min(limit, 200))
-    rows = [_serialize(d) async for d in cursor]
-    return {"provider": settings.scrutiny_provider, "events": rows}
+    rows = await postgres.fetch(
+        "SELECT * FROM scrutiny_events ORDER BY at DESC LIMIT %s",
+        (min(limit, 200),))
+    return {"provider": settings.scrutiny_provider,
+            "events": [_serialize(r) for r in rows]}
 
 
 @app.get("/api/degradation")
@@ -333,12 +388,12 @@ async def get_degradation(limit: int = 50):
     """Constitution §11 made visible: what has fallen back, and how often.
     A non-empty counter here is the system telling you it is not at full
     strength — silence is the only healthy reading."""
-    db = mongo.get_db()
-    cursor = db[degradation.DEGRADED_EVENTS].find({}, {"_id": 0}) \
-        .sort("at", -1).limit(min(limit, 200))
+    rows = await postgres.fetch(
+        "SELECT * FROM telemetry_events WHERE kind = 'degraded' "
+        "ORDER BY at DESC LIMIT %s", (min(limit, 200),))
     return {"counts": degradation.counts(),
             "total": degradation.total(),
-            "recent": [_serialize(d) async for d in cursor]}
+            "recent": [_serialize(r) for r in rows]}
 
 
 @app.get("/api/scrutiny/calibration")
@@ -350,7 +405,7 @@ async def get_scrutiny_calibration(days: int = 7):
     Drift is fixed by changing thresholds, `k`, or the prompt — never by
     raising temperature, which would attack the consistency being measured."""
     from botmaximus.scrutiny import calibration
-    return (await calibration.report(mongo.get_db(), days)).to_dict()
+    return (await calibration.report(None, days)).to_dict()
 
 
 @app.get("/api/venue")
