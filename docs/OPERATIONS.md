@@ -162,6 +162,23 @@ stored anything reads as unhealthy and restart-loops it.
 
 ## Backups
 
+> **Storage v2.0 (2026-08-09): Postgres is the store now.** Use
+> **`ops/pg_backup.py`** — see `docs/DEPLOYMENT.md` Phase 6:
+>
+> ```bash
+> python ops/pg_backup.py full            # pg_dump -Fc, gzipped, to object storage
+> python ops/pg_backup.py drill           # restore to scratch, verify counts, drop
+> python ops/pg_backup.py mirror --days 90
+> ```
+>
+> The drill compares restored row counts against the **live** database, so a
+> restore that produces empty tables fails instead of passing. Continuous WAL
+> archiving is configured on the server (`archive_command`), not by a script.
+>
+> Everything below concerns `ops/mongo_backup.py`, which is retained **only**
+> until `ops/migrate_from_mongo.py` has carried the old data across and its
+> counts have been verified. After that, both it and `pymongo` come out.
+
 `ops/mongo_backup.py`. Not `mongodump` — that tool is not in the portable
 MongoDB zip this project ships, and more importantly the high-frequency series
 are **time-series collections**, which `mongodump` dumps at the internal
