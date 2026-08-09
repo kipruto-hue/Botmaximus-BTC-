@@ -36,21 +36,6 @@ class Envelope:
             if t is not None and t.tzinfo is None:
                 raise ValueError(f"{name} must be timezone-aware UTC")
 
-    def to_doc(self) -> dict[str, Any]:
-        """Mongo document. `meta` is the time-series metaField; `event_time` the timeField."""
-        return {
-            "event_time": self.event_time,
-            "meta": {"dataset_id": self.dataset_id, "source": self.source, "symbol": self.symbol},
-            "collection_time": self.collection_time,
-            "ingest_time": self.ingest_time,
-            "payload": self.payload,
-            "quality_flags": self.quality_flags,
-            "quality_ok": self.quality_ok,
-            "reaction_ref": self.reaction_ref,
-            "stage_latency_ms": self.stage_latency_ms,
-            "backfill": self.backfill,
-        }
-
     def to_record(self, config_hash: str | None = None):
         """Convert to the §2 storage envelope.
 

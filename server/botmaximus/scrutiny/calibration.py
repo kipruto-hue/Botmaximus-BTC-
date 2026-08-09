@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from botmaximus.scrutiny.gate import SCRUTINY_EVENTS
+from botmaximus.storage import postgres
 
 
 @dataclass
@@ -59,19 +59,23 @@ async def join_outcome(db, intent_id: str, adverse: bool,
     Called after a trade closes — and for vetoes, after the horizon the trade
     *would* have run. A veto whose counterfactual is never measured cannot be
     judged, and an unjudgeable gate drifts without anyone noticing.
+
+    `db` is accepted and ignored; verdicts live in Postgres now.
     """
-    await db[SCRUTINY_EVENTS].update_one(
-        {"intent_id": intent_id},
-        {"$set": {"realized_known": True,
-                  "realized_adverse": bool(adverse),
-                  "realized_return_pct": realized_return_pct,
-                  "realized_at": datetime.now(timezone.utc)}})
+    await postgres.execute(
+        "UPDATE scrutiny_events SET realized_known = true, "
+        "  realized_adverse = %s, realized_return_pct = %s, realized_at = %s "
+        "WHERE intent_id = %s",
+        (bool(adverse), realized_return_pct, datetime.now(timezone.utc),
+         intent_id))
 
 
-async def report(db, days: int = 7) -> CalibrationReport:
+async def report(db=None, days: int = 7) -> CalibrationReport:
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = [d async for d in db[SCRUTINY_EVENTS].find(
-        {"at": {"$gte": since}}, {"_id": 0})]
+    rows = await postgres.fetch(
+        "SELECT verdict, provider_version, realized_known, realized_adverse, "
+        "       reason, state_key_hash "
+        "FROM scrutiny_events WHERE at >= %s ORDER BY at", (since,))
 
     known = [r for r in rows if r.get("realized_known")]
     versions = sorted({r.get("provider_version", "?") for r in rows})

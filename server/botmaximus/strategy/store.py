@@ -17,9 +17,6 @@ from botmaximus.strategy.lifecycle import Transition
 from botmaximus.strategy.schema import StrategyDefinition
 from botmaximus.strategy.validator import signature
 
-STRATEGIES = "strategies"
-STRATEGY_EVENTS = "strategy_events"
-
 
 async def ensure_indexes() -> None:
     """No-op: keys and indexes are part of `schema.sql`."""

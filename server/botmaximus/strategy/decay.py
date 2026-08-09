@@ -35,8 +35,6 @@ from botmaximus.execution.ledger import LEDGER, RECONCILED
 
 log = logging.getLogger(__name__)
 
-DECAY_EVENTS = "decay_events"
-
 
 @dataclass(frozen=True)
 class DecayTrigger:

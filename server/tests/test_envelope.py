@@ -25,17 +25,41 @@ def test_from_epoch_ms_is_utc():
     assert t.tzinfo == timezone.utc
 
 
-def test_to_doc_shape():
+def test_to_record_carries_the_envelope_across():
+    """`to_doc` (a Mongo document) is gone; `to_record` is the real write path.
+
+    The two models disagree about one field, and this is where that is
+    reconciled: the pipeline uses `quality_flags` for advisory marks on records
+    that PASSED, while Storage v2.0 §2 defines them as the names of checks a
+    record FAILED. Advisory marks become `annotations`.
+    """
     env = make_env()
-    doc = env.to_doc()
-    assert doc["meta"] == {"dataset_id": "btc_price_tick", "source": "binance", "symbol": "BTCUSDT"}
-    assert doc["event_time"] == env.event_time
-    assert doc["quality_ok"] is True
-    assert doc["reaction_ref"] is None
-    assert set(doc) == {
-        "event_time", "meta", "collection_time", "ingest_time", "payload",
-        "quality_flags", "quality_ok", "reaction_ref", "stage_latency_ms", "backfill",
-    }
+    rec = env.to_record()
+    assert rec.dataset_id == "btc_price_tick"
+    assert rec.source == "binance"
+    assert rec.event_time == env.event_time
+    assert rec.quality_ok is True
+    assert rec.quality_flags == ()
+
+
+def test_a_failed_envelope_carries_its_reasons_as_flags():
+    env = make_env()
+    env.quarantine_reasons = ["lookahead_violation"]
+    rec = env.to_record()
+    assert rec.quality_ok is False
+    assert "lookahead_violation" in rec.quality_flags
+    assert rec.annotations == ()
+
+
+def test_advisory_flags_survive_as_annotations():
+    """The gate marks every record `single_source`; folding that into
+    quality_flags would quarantine the entire feed."""
+    env = make_env()
+    env.quality_flags = ["single_source"]
+    rec = env.to_record()
+    assert rec.quality_ok is True
+    assert rec.quality_flags == ()
+    assert rec.annotations == ("single_source",)
 
 
 def test_freshness_ms():

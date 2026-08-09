@@ -1,10 +1,10 @@
 r"""The ledger read seam — where prompt context comes from.
 
-§4: the four ledgers *are* the memory. `trial_ledger` holds what passed
-validation and why, `execution_ledger` holds predicted-vs-realized cost,
-`scrutiny_events` holds every verdict, `generations/*.json` holds every
-proposal. On each call we assemble context from them and hand it to a fresh,
-stateless model.
+§4: the four ledgers *are* the memory. `trials` holds every evaluation ever
+made, `execution_ledger` holds predicted-vs-realized cost, `scrutiny_events`
+holds every verdict, and `generations` holds every proposal (with the full
+prompt and response in the Parquet archive). On each call we assemble context
+from them and hand it to a fresh, stateless model.
 
 Every read the prompt builders need goes through this one module. Two reasons,
 and the second is the operational one:

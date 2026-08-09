@@ -1,6 +1,6 @@
 """Kill stack (§4.3): L1 strategy → L2 portfolio → L3 master.
 
-State is persisted to Mongo on every change and reloaded on init, so a
+State is persisted to Postgres (`risk_state`) on every change and reloaded on init, so a
 process restart can never silently disarm a kill (§4.6). There is no code
 path that suppresses L3; clearing it requires the operator reset token —
 a deliberate action outside normal flow (§2.1, §2.8).

@@ -40,8 +40,6 @@ from datetime import datetime, timezone
 from botmaximus.strategy.schema import StrategyDefinition
 from botmaximus.strategy.validator import signature
 
-TRIAL_LEDGER = "trial_ledger"
-
 
 async def ensure_indexes() -> None:
     """No-op: `trials`'s composite primary key is declared in `schema.sql`.

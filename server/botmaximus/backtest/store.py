@@ -14,7 +14,6 @@ from botmaximus.backtest.validation import ValidationVerdict
 
 log = logging.getLogger(__name__)
 
-BACKTEST_RUNS_COLLECTION = "backtest_runs"
 
 #: Downsampling limit for the curve returned to *callers and the dashboard*.
 #:

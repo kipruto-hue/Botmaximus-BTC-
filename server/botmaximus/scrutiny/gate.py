@@ -33,8 +33,6 @@ from botmaximus.scrutiny.provider import VETO, ScrutinyProvider, ScrutinyVerdict
 
 log = logging.getLogger(__name__)
 
-SCRUTINY_EVENTS = "scrutiny_events"
-
 
 def build_provider() -> ScrutinyProvider:
     """`rules` in this build. `llm` exists but is unreachable — its constructor

@@ -258,6 +258,11 @@ async def get_risk():
     return risk_core.snapshot()
 
 
+def _defn(row: dict) -> dict:
+    """The compiled definition, or an empty dict when the blob is absent."""
+    return row.get("definition") or {}
+
+
 @app.get("/api/strategies")
 async def get_strategies(state: str | None = None):
     """The strategy population and where each one sits in its lifecycle.
@@ -281,9 +286,14 @@ async def get_strategies(state: str | None = None):
                 "version": d.get("version"),
                 "lifecycle_state": d["lifecycle_state"],
                 "origin": d.get("origin"),
-                "direction": d["definition"].get("direction"),
-                "regime_scope": d["definition"].get("regime_scope"),
-                "required_feeds": d["definition"].get("required_feeds"),
+                # `definition` comes from a LEFT JOIN on the blob table, so it
+                # is None whenever the blob is absent — a migrated row, or a
+                # strategy registered before its definition landed. Indexing
+                # into it directly turns that into a 500 on the dashboard's
+                # main panel rather than a missing field on one row.
+                "direction": _defn(d).get("direction"),
+                "regime_scope": _defn(d).get("regime_scope"),
+                "required_feeds": _defn(d).get("required_feeds"),
                 "rationale": d.get("rationale"),
                 "warnings": d.get("warnings", []),
                 "last_verdict": d.get("last_verdict"),

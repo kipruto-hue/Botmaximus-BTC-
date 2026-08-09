@@ -5,8 +5,8 @@ because they answer different questions:
 
 - an **in-memory counter**, so "is anything degraded right now?" is answerable
   without a database round-trip and shows on the dashboard;
-- a **`degraded_events` document**, so "when did this start, and what were the
-  circumstances?" is answerable after the fact.
+- a **`telemetry_events` row with `kind='degraded'`**, so "when did this start,
+  and what were the circumstances?" is answerable after the fact.
 
 ## Why this exists rather than a log line
 
@@ -19,9 +19,11 @@ either zero or it is not.
 
 ## Recording is best-effort, but never silent about its own failure
 
-If Mongo is unavailable the counter still increments and a WARNING is logged.
+If Postgres is unavailable the counter still increments and a WARNING is logged.
 Losing the audit trail must not take down the caller — a degradation recorder
-that raises would turn a survivable fallback into an outage.
+that raises would turn a survivable fallback into an outage. (Storage v2.0 §7
+makes an unreachable Postgres an L2 halt in its own right; that is decided by
+`storage/degrade.py`, not by this recorder failing to write.)
 
 This module deliberately lives outside `pipeline/`: the build constitution
 forbids modifying the data-layer telemetry, and degradation is not a data-layer
@@ -35,7 +37,6 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
-DEGRADED_EVENTS = "degraded_events"
 
 #: label -> count, for this process lifetime.
 _counts: Counter[str] = Counter()

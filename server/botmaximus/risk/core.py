@@ -25,8 +25,6 @@ from botmaximus.risk.state import (
 
 log = logging.getLogger(__name__)
 
-RISK_STATE_COLLECTION = "risk_state"
-RISK_EVENTS_COLLECTION = "risk_events"
 PORTFOLIO_DOC_ID = "portfolio"
 
 EDGE_COST_MARGIN = 1.5          # expected edge must be ≥ 1.5× expected cost

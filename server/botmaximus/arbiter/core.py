@@ -40,8 +40,6 @@ from botmaximus.risk.state import OrderIntent
 
 log = logging.getLogger(__name__)
 
-ARBITER_EVENTS = "arbiter_events"
-
 
 @dataclass(frozen=True)
 class StrategySignal:
