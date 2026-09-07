@@ -153,7 +153,7 @@ class TradeLoop:
             return await self._record(BarOutcome(
                 SKIPPED, f"risk_halted:{block}", "preconditions", bar_time))
 
-        if not self._within_window():
+        if not self._within_window(bar_time):
             return await self._record(BarOutcome(
                 SKIPPED, "outside_window", "preconditions", bar_time))
 
@@ -206,8 +206,16 @@ class TradeLoop:
             len(signals), detail={"execution": result}))
 
     # ---- helpers ----------------------------------------------------
-    def _within_window(self) -> bool:
+    def _within_window(self, at: datetime | None = None) -> bool:
         """§7.6 — the window is enforced at the loop, not only at the executor.
+
+        Judged against the BAR's close time, not the wall clock. `may_enter()`
+        defaults to `now`, and taking that default made the answer depend on
+        when the loop happened to run: the same bar replayed at a different
+        hour got a different decision, so the record was not reproducible and
+        the window test passed or failed according to the time of day. A
+        decision chain that cannot be replayed to the same answer is not a
+        decision chain.
 
         An unset window means no window is configured. That is deliberately
         permissive here and deliberately *not* permissive in the executor,
@@ -217,7 +225,7 @@ class TradeLoop:
         """
         from botmaximus.execution.session import Session
         session = self._session if self._session is not None else Session.from_settings()
-        return True if session is None else session.may_enter()
+        return True if session is None else session.may_enter(at)
 
     async def _record(self, outcome: BarOutcome) -> BarOutcome:
         """One row per bar-close event (§8). Silent success is a bug.

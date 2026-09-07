@@ -97,6 +97,12 @@ def _venue_sources(gather_q) -> list:
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     global risk_core
+    # The pool is lazy and opens no socket on import, so it must be opened
+    # here — before ensure_schema() is the first thing to want a connection.
+    # Its absence surfaced as PoolClosed wrapped in PostgresUnavailable, i.e.
+    # as "the database is unreachable", which it was not. `postgres.close()`
+    # in the finally below is the other half of this pair.
+    await postgres.open_pool()
     await ensure_schema()
     await coverage.ensure_indexes()
     await strategy_store.ensure_indexes()
